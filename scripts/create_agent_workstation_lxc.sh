@@ -11,6 +11,8 @@ NOVNC_HOST_PORT="${NOVNC_HOST_PORT:-16901}"
 CUA_HOST_PORT="${CUA_HOST_PORT:-28000}"
 SSH_HOST_PORT="${SSH_HOST_PORT:-2222}"
 BOOTSTRAP="${BOOTSTRAP:-${SCRIPT_DIR}/bootstrap_agent_workstation.sh}"
+SYNC_CODEX_PROFILE="${SYNC_CODEX_PROFILE:-yes}"
+CODEX_SYNC_SCRIPT="${CODEX_SYNC_SCRIPT:-${SCRIPT_DIR}/sync_codex_profile_to_lxc.sh}"
 
 log() { printf '[agent-lxc] %s\n' "$*"; }
 
@@ -73,6 +75,15 @@ lxc start "${INSTANCE}" >/dev/null 2>&1 || true
 log "Pushing and running workstation bootstrap"
 lxc file push "${BOOTSTRAP}" "${INSTANCE}/root/bootstrap_agent_workstation.sh"
 lxc exec "${INSTANCE}" -- bash /root/bootstrap_agent_workstation.sh
+
+if [ "${SYNC_CODEX_PROFILE}" = "yes" ]; then
+  if [ -x "${CODEX_SYNC_SCRIPT}" ]; then
+    log "Syncing Codex profile and repo-bundled skills"
+    INSTANCE="${INSTANCE}" AGENT_USER="agent" "${CODEX_SYNC_SCRIPT}"
+  else
+    log "Codex sync script not executable: ${CODEX_SYNC_SCRIPT}"
+  fi
+fi
 
 log "Ready"
 printf 'noVNC: http://127.0.0.1:%s/\n' "${NOVNC_HOST_PORT}"

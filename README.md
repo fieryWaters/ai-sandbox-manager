@@ -11,6 +11,7 @@ The current workstation profile creates an Ubuntu container with:
 - Docker-in-LXC with NVIDIA GPU support
 - PyTorch Docker GPU smoke testing
 - SSH server with a host proxy for remote access
+- Selected Codex profile sync, repo-bundled skills, and `codex-yolo`
 
 ## Create The Workstation
 
@@ -25,6 +26,25 @@ By default this creates or updates `youart-agent-base` and exposes:
 - SSH: `ssh -p 2222 agent@127.0.0.1`
 
 The default noVNC password is `youart-agent`.
+
+## Codex Profile Sync
+
+The create script runs `scripts/sync_codex_profile_to_lxc.sh` by default. It copies selected Codex files from the host into `/home/agent/.codex`:
+
+- `config.toml`
+- `rules/`
+- `memories/`
+- `skills/`
+- `auth.json` when `INCLUDE_CODEX_AUTH=yes`
+
+It intentionally skips Codex logs, caches, sqlite state, shell snapshots, and history. Repo-bundled skills live in `codex/skills/` and are installed even if the host profile does not contain them.
+
+Useful overrides:
+
+```bash
+SYNC_CODEX_PROFILE=no sg lxd -c './scripts/create_agent_workstation_lxc.sh'
+INCLUDE_CODEX_AUTH=no sg lxd -c './scripts/sync_codex_profile_to_lxc.sh'
+```
 
 ## Verify
 
