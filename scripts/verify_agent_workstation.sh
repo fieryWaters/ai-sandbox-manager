@@ -44,7 +44,7 @@ curl -fsS "http://127.0.0.1:${CUA_HOST_PORT}/status" | grep -q '"status":"ok"\|"
 curl -fsS -X POST "http://127.0.0.1:${CUA_HOST_PORT}/cmd" \
   -H 'Content-Type: application/json' \
   -d '{"command":"get_screen_size","params":{}}' \
-  | grep -q '"width": 1280'
+  | grep -Eq '"success": true.*"width": [0-9]+.*"height": [0-9]+'
 printf 'CUA ok on http://127.0.0.1:%s/\n' "${CUA_HOST_PORT}"
 
 log "Chromium persistent profile"
