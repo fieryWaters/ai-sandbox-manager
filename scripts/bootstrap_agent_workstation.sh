@@ -84,12 +84,18 @@ python3 -m venv /opt/cua-computer-server
 
 log "Installing Codex CLI"
 npm install -g @openai/codex
-cat >/usr/local/bin/codex-yolo <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "$@"
-EOF
-chmod +x /usr/local/bin/codex-yolo
+rm -f /usr/local/bin/codex-yolo
+runuser -u "${AGENT_USER}" -- bash -lc '
+  touch ~/.bashrc
+  sed -i \
+    -e "/^alias yolo=codex-yolo$/d" \
+    -e "/^alias cy=codex-yolo$/d" \
+    -e "/^alias codex=codex-yolo$/d" \
+    -e "/^alias codex='\''command codex --dangerously-bypass-approvals-and-sandbox'\''$/d" \
+    ~/.bashrc
+  grep -qxF "# Run Codex without approval prompts or sandboxing." ~/.bashrc || printf "\n# Run Codex without approval prompts or sandboxing.\n" >> ~/.bashrc
+  printf "%s\n" "alias codex='\''command codex --dangerously-bypass-approvals-and-sandbox'\''" >> ~/.bashrc
+'
 
 log "Installing Playwright Chromium and wrapper"
 npm install -g playwright

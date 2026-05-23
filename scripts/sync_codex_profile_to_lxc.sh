@@ -21,18 +21,19 @@ require() {
   fi
 }
 
-install_codex_yolo() {
-  log "Installing codex-yolo helper"
-  lxc exec "${INSTANCE}" -- bash -lc 'cat >/usr/local/bin/codex-yolo' <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "$@"
-EOF
-  lxc exec "${INSTANCE}" -- chmod +x /usr/local/bin/codex-yolo
+install_codex_alias() {
+  log "Installing host-style Codex shell alias"
+  lxc exec "${INSTANCE}" -- rm -f /usr/local/bin/codex-yolo
   lxc exec "${INSTANCE}" -- runuser -u "${AGENT_USER}" -- bash -lc '
     touch ~/.bashrc
-    grep -qxF "alias yolo=codex-yolo" ~/.bashrc || printf "\nalias yolo=codex-yolo\n" >> ~/.bashrc
-    grep -qxF "alias cy=codex-yolo" ~/.bashrc || printf "alias cy=codex-yolo\n" >> ~/.bashrc
+    sed -i \
+      -e "/^alias yolo=codex-yolo$/d" \
+      -e "/^alias cy=codex-yolo$/d" \
+      -e "/^alias codex=codex-yolo$/d" \
+      -e "/^alias codex='\''command codex --dangerously-bypass-approvals-and-sandbox'\''$/d" \
+      ~/.bashrc
+    grep -qxF "# Run Codex without approval prompts or sandboxing." ~/.bashrc || printf "\n# Run Codex without approval prompts or sandboxing.\n" >> ~/.bashrc
+    printf "%s\n" "alias codex='\''command codex --dangerously-bypass-approvals-and-sandbox'\''" >> ~/.bashrc
   '
 }
 
@@ -159,6 +160,6 @@ sync_repo_skills
 fix_permissions
 install_git_hooks
 append_lxc_trust
-install_codex_yolo
+install_codex_alias
 
 log "Codex sync complete"

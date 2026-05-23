@@ -11,7 +11,7 @@ The current workstation profile creates an Ubuntu container with:
 - Docker-in-LXC with NVIDIA GPU support
 - PyTorch Docker GPU smoke testing
 - SSH server with a host proxy for remote access
-- Selected Codex profile sync, repo-bundled skills, and `codex-yolo`
+- Selected Codex profile sync, repo-bundled skills, and host-style Codex shell alias
 
 ## Create The Workstation
 
@@ -42,6 +42,12 @@ The create script runs `scripts/sync_codex_profile_to_lxc.sh` by default. It cop
 It intentionally skips Codex logs, caches, sqlite state, shell snapshots, and history. Repo-bundled skills live in `codex/skills/` and are installed even if the host profile does not contain them.
 
 The synced profile also installs hook-based push guards for agent shells. Codex loads `hooks.json`, and the LXC agent user gets global Git config pointing `core.hooksPath` at `~/.codex/git-hooks`. Normal Git commands are untouched; `git push` is blocked by the pre-push hook unless an operator deliberately bypasses hooks.
+
+Interactive agent shells mirror the host Codex alias:
+
+```bash
+alias codex='command codex --dangerously-bypass-approvals-and-sandbox'
+```
 
 Useful overrides:
 
