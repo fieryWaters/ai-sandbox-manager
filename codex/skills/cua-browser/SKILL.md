@@ -23,9 +23,16 @@ Inside the LXC:
 - User: `agent`
 - noVNC/VNC password: `youart-agent`
 - CUA API: `http://127.0.0.1:8000/`
+- App URL: `http://127.0.0.1:18080/`
 - Chromium wrapper: `/usr/local/bin/chromium`
 - Chromium profile: `/home/agent/.config/chromium`
 - Agent repos: `/home/agent/git-repos`
+
+Port rule:
+
+- If you are on the parent host, use CUA at `http://127.0.0.1:28000`.
+- If you are already inside the LXC, use CUA at `http://127.0.0.1:8000`.
+- Do not use the parent-host CUA port `28000` from inside the LXC.
 
 Check state from the host:
 
@@ -37,13 +44,73 @@ curl -fsS -X POST http://127.0.0.1:28000/cmd \
   -d '{"command":"get_screen_size","params":{}}'
 ```
 
-Launch a page in the persistent desktop:
+Check state from inside the LXC:
+
+```bash
+curl -fsS http://127.0.0.1:8000/status
+curl -fsS http://127.0.0.1:8000/commands
+curl -fsS -X POST http://127.0.0.1:8000/cmd \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"get_screen_size","params":{}}'
+```
+
+Launch a page in the persistent desktop from inside the LXC:
+
+```bash
+DISPLAY=:1 /usr/local/bin/chromium http://127.0.0.1:18080 >/tmp/chromium.log 2>&1 &
+```
+
+Launch a page in the persistent desktop from the parent host:
 
 ```bash
 sg lxd -c 'lxc exec youart-agent-base -- runuser -u agent -- sh -lc "DISPLAY=:1 chromium http://127.0.0.1:18080 >/tmp/chromium.log 2>&1 &"'
 ```
 
-Use noVNC for human supervision and the CUA API for screenshots/clicks/types. CUA `/cmd` responses may be server-sent-event text; inspect the raw response when JSON parsing fails.
+Use noVNC for human supervision and the CUA API for screenshots/clicks/types. CUA `/cmd` responses are server-sent-event style lines such as `data: {...}`, so strip the `data: ` prefix before parsing JSON.
+
+Minimal CUA HTTP usage:
+
+```bash
+CUA_BASE=http://127.0.0.1:8000  # inside LXC; use 28000 on the parent host
+
+curl -sS -X POST "$CUA_BASE/cmd" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"left_click","params":{"x":640,"y":420}}'
+
+curl -sS -X POST "$CUA_BASE/cmd" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"type_text","params":{"text":"hello"}}'
+
+curl -sS -X POST "$CUA_BASE/cmd" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"press_key","params":{"key":"Enter"}}'
+
+curl -sS -X POST "$CUA_BASE/cmd" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"hotkey","params":{"keys":["CTRL","L"]}}'
+
+curl -sS -X POST "$CUA_BASE/cmd" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"scroll","params":{"x":0,"y":-5}}'
+```
+
+Capture a screenshot to a PNG:
+
+```bash
+CUA_BASE=http://127.0.0.1:8000  # inside LXC; use 28000 on the parent host
+raw="$(curl -sS -X POST "$CUA_BASE/cmd" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"screenshot","params":{}}')"
+printf '%s\n' "${raw#data: }" | python3 -c '
+import base64, json, sys
+payload = json.load(sys.stdin)
+open("/tmp/cua-screen.png", "wb").write(base64.b64decode(payload["image_data"]))
+'
+```
+
+Useful command names from `/commands`: `screenshot`, `get_screen_size`, `get_cursor_position`, `left_click`, `double_click`, `right_click`, `move_cursor`, `drag_to`, `type_text`, `press_key`, `hotkey`, `scroll`, `scroll_down`, `scroll_up`, `open`, and `launch`.
+
+For visual bug hunts, prefer: open page in Chromium on `DISPLAY=:1`, capture screenshots with CUA, use noVNC only for supervision, and use DOM/CDP measurement only as a supplement.
 
 Mac/noVNC note: noVNC can force clipped viewport mode on macOS overlay scrollbars. Prefer opening with `#autoconnect=1&resize=scale&password=youart-agent`. If the desktop appears zoomed/panned after paste or scroll gestures, reset host browser zoom with `Cmd+0`, remote Chromium zoom with `Ctrl+0`, or use `Cmd+scroll`/remote app zoom controls.
 
