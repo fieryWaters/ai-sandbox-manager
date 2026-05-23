@@ -32,7 +32,7 @@ apt-get install -y \
   xfce4 xfce4-terminal tigervnc-standalone-server tigervnc-common \
   gnome-screenshot xdotool xclip wmctrl ffmpeg \
   python3 python3-dev python3-venv python3-pip python3-tk build-essential \
-  nodejs docker.io
+  nodejs docker.io docker-compose-v2
 
 log "Creating ${AGENT_USER} user"
 if ! id "${AGENT_USER}" >/dev/null 2>&1; then
