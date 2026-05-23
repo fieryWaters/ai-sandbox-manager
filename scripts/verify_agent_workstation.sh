@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTANCE="${INSTANCE:-youart-agent-base}"
 NOVNC_HOST_PORT="${NOVNC_HOST_PORT:-16901}"
 CUA_HOST_PORT="${CUA_HOST_PORT:-28000}"
+SSH_HOST_PORT="${SSH_HOST_PORT:-2222}"
 PYTORCH_IMAGE="${PYTORCH_IMAGE:-nvcr.io/nvidia/pytorch:25.11-py3}"
 
 log() { printf '\n[agent-verify] %s\n' "$*"; }
@@ -28,7 +29,11 @@ log "Baseline tools"
 inside 'hostname; getent hosts example.com | head -1; git --version; python3 --version; node --version; npm --version; codex --version; chromium --version'
 
 log "Services"
-inside 'systemctl is-active docker youart-vnc youart-novnc youart-cua-server'
+inside 'systemctl is-active docker ssh youart-vnc youart-novnc youart-cua-server'
+
+log "SSH host proxy"
+timeout 5 bash -c "</dev/tcp/127.0.0.1/${SSH_HOST_PORT}"
+printf 'SSH proxy ok on 127.0.0.1:%s\n' "${SSH_HOST_PORT}"
 
 log "noVNC host proxy"
 curl -fsS "http://127.0.0.1:${NOVNC_HOST_PORT}/" | grep -q noVNC

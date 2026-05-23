@@ -9,6 +9,7 @@ PROFILE="${PROFILE:-ai-macvlan}"
 GPU_ID="${GPU_ID:-nvidia.com/gpu=0}"
 NOVNC_HOST_PORT="${NOVNC_HOST_PORT:-16901}"
 CUA_HOST_PORT="${CUA_HOST_PORT:-28000}"
+SSH_HOST_PORT="${SSH_HOST_PORT:-2222}"
 BOOTSTRAP="${BOOTSTRAP:-${SCRIPT_DIR}/bootstrap_agent_workstation.sh}"
 
 log() { printf '[agent-lxc] %s\n' "$*"; }
@@ -62,6 +63,9 @@ add_device_once host-novnc proxy \
 add_device_once host-cua proxy \
   listen="tcp:0.0.0.0:${CUA_HOST_PORT}" \
   connect="tcp:127.0.0.1:8000"
+add_device_once host-ssh proxy \
+  listen="tcp:0.0.0.0:${SSH_HOST_PORT}" \
+  connect="tcp:127.0.0.1:22"
 
 log "Starting ${INSTANCE}"
 lxc start "${INSTANCE}" >/dev/null 2>&1 || true
@@ -73,3 +77,4 @@ lxc exec "${INSTANCE}" -- bash /root/bootstrap_agent_workstation.sh
 log "Ready"
 printf 'noVNC: http://127.0.0.1:%s/\n' "${NOVNC_HOST_PORT}"
 printf 'CUA:    http://127.0.0.1:%s/\n' "${CUA_HOST_PORT}"
+printf 'SSH:    ssh -p %s agent@127.0.0.1\n' "${SSH_HOST_PORT}"

@@ -28,6 +28,7 @@ apt-get update
 apt-get install -y \
   ca-certificates curl wget git gnupg gpg lsb-release software-properties-common \
   sudo jq unzip zip net-tools netcat-openbsd xdg-utils dbus-x11 x11-utils xterm \
+  openssh-server \
   xfce4 xfce4-terminal tigervnc-standalone-server tigervnc-common \
   gnome-screenshot xdotool xclip wmctrl ffmpeg \
   python3 python3-dev python3-venv python3-pip python3-tk build-essential \
@@ -44,6 +45,9 @@ chmod 0440 /etc/sudoers.d/90-youart-agent
 
 log "Configuring Docker"
 systemctl enable --now docker
+
+log "Configuring SSH"
+systemctl enable --now ssh
 
 log "Installing NVIDIA container toolkit"
 if [ ! -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ]; then
