@@ -26,7 +26,6 @@ install_codex_yolo() {
   lxc exec "${INSTANCE}" -- bash -lc 'cat >/usr/local/bin/codex-yolo' <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-export PATH="${HOME}/.codex/bin:${PATH}"
 exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "$@"
 EOF
   lxc exec "${INSTANCE}" -- chmod +x /usr/local/bin/codex-yolo
@@ -68,7 +67,7 @@ sync_host_profile() {
   fi
 
   local items=()
-  for rel in config.toml hooks.json rules memories skills hooks bin git-hooks; do
+  for rel in config.toml hooks.json rules memories skills hooks git-hooks; do
     if [ -e "${CODEX_HOME_SOURCE}/${rel}" ]; then
       items+=("${rel}")
     fi
@@ -94,7 +93,7 @@ sync_repo_codex_defaults() {
     return
   fi
 
-  for rel in hooks.json hooks bin git-hooks; do
+  for rel in hooks.json hooks git-hooks; do
     if [ ! -e "${REPO_CODEX_DIR}/${rel}" ]; then
       continue
     fi
@@ -131,21 +130,25 @@ fix_permissions() {
     find '/home/${AGENT_USER}/.codex/skills' -type f -exec chmod 644 {} + 2>/dev/null || true
     find '/home/${AGENT_USER}/.codex/hooks' -type d -exec chmod 755 {} + 2>/dev/null || true
     find '/home/${AGENT_USER}/.codex/hooks' -type f -exec chmod 755 {} + 2>/dev/null || true
-    find '/home/${AGENT_USER}/.codex/bin' -type d -exec chmod 755 {} + 2>/dev/null || true
-    find '/home/${AGENT_USER}/.codex/bin' -type f -exec chmod 755 {} + 2>/dev/null || true
     find '/home/${AGENT_USER}/.codex/git-hooks' -type d -exec chmod 755 {} + 2>/dev/null || true
     find '/home/${AGENT_USER}/.codex/git-hooks' -type f -exec chmod 755 {} + 2>/dev/null || true
   "
 }
 
-install_git_guard() {
-  log "Installing git push guard in /usr/local/bin"
+install_git_hooks() {
+  log "Installing git pre-push guard for agent user"
   lxc exec "${INSTANCE}" -- bash -lc "
-    if [ -x '/home/${AGENT_USER}/.codex/bin/git' ]; then
-      ln -sf '/home/${AGENT_USER}/.codex/bin/git' /usr/local/bin/git
+    if [ -L /usr/local/bin/git ] && [ \"\$(readlink /usr/local/bin/git)\" = '/home/${AGENT_USER}/.codex/bin/git' ]; then
+      rm -f /usr/local/bin/git
     fi
+    if [ -L /usr/bin/git ] && [ \"\$(readlink /usr/bin/git)\" = '/home/${AGENT_USER}/.codex/bin/git' ] && [ -x /usr/bin/git.real ]; then
+      rm -f /usr/bin/git
+      mv /usr/bin/git.real /usr/bin/git
+    fi
+    rm -f '/home/${AGENT_USER}/.codex/bin/git' '/home/${AGENT_USER}/.codex/bin/git-ssh'
   "
-  lxc exec "${INSTANCE}" -- runuser -u "${AGENT_USER}" -- git config --global core.hooksPath "/home/${AGENT_USER}/.codex/git-hooks"
+  lxc exec "${INSTANCE}" -- runuser -u "${AGENT_USER}" -- /usr/bin/git config --global core.hooksPath "/home/${AGENT_USER}/.codex/git-hooks"
+  lxc exec "${INSTANCE}" -- runuser -u "${AGENT_USER}" -- /usr/bin/git config --global --unset core.sshCommand 2>/dev/null || true
 }
 
 require lxc
@@ -154,7 +157,7 @@ sync_host_profile
 sync_repo_codex_defaults
 sync_repo_skills
 fix_permissions
-install_git_guard
+install_git_hooks
 append_lxc_trust
 install_codex_yolo
 

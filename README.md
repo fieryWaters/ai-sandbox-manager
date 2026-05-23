@@ -36,13 +36,12 @@ The create script runs `scripts/sync_codex_profile_to_lxc.sh` by default. It cop
 - `memories/`
 - `skills/`
 - `hooks.json` and `hooks/`
-- `bin/`
 - `git-hooks/`
 - `auth.json` when `INCLUDE_CODEX_AUTH=yes`
 
 It intentionally skips Codex logs, caches, sqlite state, shell snapshots, and history. Repo-bundled skills live in `codex/skills/` and are installed even if the host profile does not contain them.
 
-The synced profile also installs git push guards for agent shells. `codex-yolo` prepends `~/.codex/bin` to `PATH`, the LXC links the wrapper at `/usr/local/bin/git`, and global Git config points `core.hooksPath` at `~/.codex/git-hooks`. Together, normal `git push` is blocked while `git status`, `git diff`, `git clone`, and `git pull` continue to use the system Git.
+The synced profile also installs hook-based push guards for agent shells. Codex loads `hooks.json`, and the LXC agent user gets global Git config pointing `core.hooksPath` at `~/.codex/git-hooks`. Normal Git commands are untouched; `git push` is blocked by the pre-push hook unless an operator deliberately bypasses hooks.
 
 Useful overrides:
 

@@ -87,7 +87,6 @@ npm install -g @openai/codex
 cat >/usr/local/bin/codex-yolo <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-export PATH="${HOME}/.codex/bin:${PATH}"
 exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "$@"
 EOF
 chmod +x /usr/local/bin/codex-yolo
