@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+remote_name="${1:-remote}"
+remote_url="${2:-unknown-url}"
+
+cat >&2 <<EOF
+codex git guard: git push is blocked in this Codex-managed environment.
+Remote: ${remote_name} (${remote_url})
+Ask the human to review and push from outside the agent.
+EOF
+exit 1

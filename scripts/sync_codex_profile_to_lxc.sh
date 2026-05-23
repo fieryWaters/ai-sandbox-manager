@@ -10,6 +10,7 @@ CODEX_HOME_SOURCE="${CODEX_HOME_SOURCE:-${HOME}/.codex}"
 INCLUDE_CODEX_AUTH="${INCLUDE_CODEX_AUTH:-yes}"
 SYNC_HOST_CODEX_PROFILE="${SYNC_HOST_CODEX_PROFILE:-yes}"
 REPO_SKILLS_DIR="${REPO_SKILLS_DIR:-${REPO_ROOT}/codex/skills}"
+REPO_CODEX_DIR="${REPO_CODEX_DIR:-${REPO_ROOT}/codex}"
 
 log() { printf '[codex-sync] %s\n' "$*"; }
 
@@ -25,6 +26,7 @@ install_codex_yolo() {
   lxc exec "${INSTANCE}" -- bash -lc 'cat >/usr/local/bin/codex-yolo' <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="${HOME}/.codex/bin:${PATH}"
 exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "$@"
 EOF
   lxc exec "${INSTANCE}" -- chmod +x /usr/local/bin/codex-yolo
@@ -66,7 +68,7 @@ sync_host_profile() {
   fi
 
   local items=()
-  for rel in config.toml rules memories skills; do
+  for rel in config.toml hooks.json rules memories skills hooks bin git-hooks; do
     if [ -e "${CODEX_HOME_SOURCE}/${rel}" ]; then
       items+=("${rel}")
     fi
@@ -84,6 +86,26 @@ sync_host_profile() {
   lxc exec "${INSTANCE}" -- bash -lc "install -d -m 700 -o '${AGENT_USER}' -g '${AGENT_USER}' '/home/${AGENT_USER}/.codex'"
   tar -C "${CODEX_HOME_SOURCE}" -cf - "${items[@]}" \
     | lxc exec "${INSTANCE}" -- tar -C "/home/${AGENT_USER}/.codex" -xf -
+}
+
+sync_repo_codex_defaults() {
+  if [ ! -d "${REPO_CODEX_DIR}" ]; then
+    log "Repo Codex defaults directory not found: ${REPO_CODEX_DIR}"
+    return
+  fi
+
+  for rel in hooks.json hooks bin git-hooks; do
+    if [ ! -e "${REPO_CODEX_DIR}/${rel}" ]; then
+      continue
+    fi
+    if lxc exec "${INSTANCE}" -- test -e "/home/${AGENT_USER}/.codex/${rel}"; then
+      log "Keeping host-synced Codex ${rel}"
+      continue
+    fi
+    log "Installing repo default Codex ${rel}"
+    tar -C "${REPO_CODEX_DIR}" -cf - "${rel}" \
+      | lxc exec "${INSTANCE}" -- tar -C "/home/${AGENT_USER}/.codex" -xf -
+  done
 }
 
 sync_repo_skills() {
@@ -107,14 +129,32 @@ fix_permissions() {
     [ ! -f '/home/${AGENT_USER}/.codex/config.toml' ] || chmod 600 '/home/${AGENT_USER}/.codex/config.toml'
     find '/home/${AGENT_USER}/.codex/skills' -type d -exec chmod 755 {} + 2>/dev/null || true
     find '/home/${AGENT_USER}/.codex/skills' -type f -exec chmod 644 {} + 2>/dev/null || true
+    find '/home/${AGENT_USER}/.codex/hooks' -type d -exec chmod 755 {} + 2>/dev/null || true
+    find '/home/${AGENT_USER}/.codex/hooks' -type f -exec chmod 755 {} + 2>/dev/null || true
+    find '/home/${AGENT_USER}/.codex/bin' -type d -exec chmod 755 {} + 2>/dev/null || true
+    find '/home/${AGENT_USER}/.codex/bin' -type f -exec chmod 755 {} + 2>/dev/null || true
+    find '/home/${AGENT_USER}/.codex/git-hooks' -type d -exec chmod 755 {} + 2>/dev/null || true
+    find '/home/${AGENT_USER}/.codex/git-hooks' -type f -exec chmod 755 {} + 2>/dev/null || true
   "
+}
+
+install_git_guard() {
+  log "Installing git push guard in /usr/local/bin"
+  lxc exec "${INSTANCE}" -- bash -lc "
+    if [ -x '/home/${AGENT_USER}/.codex/bin/git' ]; then
+      ln -sf '/home/${AGENT_USER}/.codex/bin/git' /usr/local/bin/git
+    fi
+  "
+  lxc exec "${INSTANCE}" -- runuser -u "${AGENT_USER}" -- git config --global core.hooksPath "/home/${AGENT_USER}/.codex/git-hooks"
 }
 
 require lxc
 
 sync_host_profile
+sync_repo_codex_defaults
 sync_repo_skills
 fix_permissions
+install_git_guard
 append_lxc_trust
 install_codex_yolo
 
