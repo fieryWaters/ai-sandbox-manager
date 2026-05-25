@@ -53,7 +53,6 @@ append_lxc_trust() {
     }
     add_trust "/home/agent"
     add_trust "/home/agent/git-repos"
-    add_trust "/home/agent/git-repos/YouArtStudiosWeb"
   '
 }
 

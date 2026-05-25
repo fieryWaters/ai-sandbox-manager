@@ -250,8 +250,8 @@ main() {
   local default_dns
   default_uplink="$(detect_uplink)"
   default_dns="$(detect_gateway)"
-  default_uplink="${default_uplink:-enP7s7}"
-  default_dns="${default_dns:-192.168.1.254}"
+  default_uplink="${default_uplink:-eth0}"
+  default_dns="${default_dns:-1.1.1.1}"
 
   case "$mode" in
     setup)
@@ -259,13 +259,13 @@ main() {
       validate_config_name "$CONFIG_NAME"
       prompt CONTAINER "Container name" "ai-sandbox"
       prompt PROFILE "Macvlan profile name" "ai-macvlan"
-      prompt POOL "Storage pool name" "agent_lxd"
-      prompt SOURCE "Storage source path" "/mnt/external_ssd/agent_lxd"
+      prompt POOL "Storage pool name" "ai_sandbox_pool"
+      prompt SOURCE "Storage source path" "/var/lib/ai-sandbox-manager/storage"
       prompt UPLINK "Host uplink interface for macvlan" "$default_uplink"
       prompt AUTOSTART "Enable container autostart (yes/no)" "yes"
       prompt PRIVILEGED "Enable privileged LXC mode for Docker-in-LXC GPU support (yes/no)" "no"
       DNS1="$default_dns"
-      DNS2="1.1.1.1"
+      DNS2="8.8.8.8"
       echo
       log "About to apply setup with:"
       log "config=$CONFIG_NAME container=$CONTAINER profile=$PROFILE pool=$POOL source=$SOURCE uplink=$UPLINK dns=($DNS1,$DNS2) autostart=$AUTOSTART privileged=$PRIVILEGED"

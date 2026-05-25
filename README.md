@@ -25,7 +25,7 @@ By default this creates or updates `youart-agent-base` and exposes:
 - CUA: `http://127.0.0.1:28000/`
 - SSH: `ssh -p 2222 agent@127.0.0.1`
 
-The default noVNC password is `youart-agent`.
+The default noVNC password is `agent-desktop`.
 
 ## Codex Profile Sync
 
@@ -71,10 +71,10 @@ INSTANCE=agent-001 NOVNC_HOST_PORT=16911 CUA_HOST_PORT=28010 SSH_HOST_PORT=2231 
   sg lxd -c './scripts/create_agent_workstation_lxc.sh'
 ```
 
-From another machine that can SSH to the host, use a jump through the host:
+From another machine that can SSH to the host, use a jump through your host:
 
 ```bash
-ssh -J spark -p 2222 agent@127.0.0.1
+ssh -J your-host -p 2222 agent@127.0.0.1
 ```
 
 ```bash

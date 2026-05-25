@@ -5,12 +5,14 @@ export DEBIAN_FRONTEND=noninteractive
 
 AGENT_USER="${AGENT_USER:-agent}"
 AGENT_PASS="${AGENT_PASS:-agent}"
-VNC_PW="${VNC_PW:-youart-agent}"
+VNC_PW="${VNC_PW:-agent-desktop}"
 VNC_RESOLUTION="${VNC_RESOLUTION:-1280x800}"
 VNC_COL_DEPTH="${VNC_COL_DEPTH:-24}"
 VNC_PORT="${VNC_PORT:-5901}"
 NOVNC_PORT="${NOVNC_PORT:-6901}"
 API_PORT="${API_PORT:-8000}"
+DOCKER_DNS1="${DOCKER_DNS1:-1.1.1.1}"
+DOCKER_DNS2="${DOCKER_DNS2:-8.8.8.8}"
 
 log() { printf '[agent-bootstrap] %s\n' "$*"; }
 
@@ -63,9 +65,11 @@ nvidia-ctk runtime configure --runtime=docker
 sed -i 's/^#\?no-cgroups.*/no-cgroups = true/' /etc/nvidia-container-runtime/config.toml
 tmp_daemon="$(mktemp)"
 if [ -s /etc/docker/daemon.json ]; then
-  jq '.dns = ["192.168.1.254", "1.1.1.1"]' /etc/docker/daemon.json >"${tmp_daemon}"
+  jq --arg dns1 "${DOCKER_DNS1}" --arg dns2 "${DOCKER_DNS2}" \
+    '.dns = [$dns1, $dns2]' /etc/docker/daemon.json >"${tmp_daemon}"
 else
-  printf '{"dns":["192.168.1.254","1.1.1.1"]}\n' >"${tmp_daemon}"
+  jq -n --arg dns1 "${DOCKER_DNS1}" --arg dns2 "${DOCKER_DNS2}" \
+    '{dns: [$dns1, $dns2]}' >"${tmp_daemon}"
 fi
 install -m 0644 "${tmp_daemon}" /etc/docker/daemon.json
 rm -f "${tmp_daemon}"
@@ -201,7 +205,7 @@ exec /opt/cua-computer-server/bin/python -m computer_server \
   --backend vnc \
   --vnc-host "${CUA_VNC_HOST:-127.0.0.1}" \
   --vnc-port "${CUA_VNC_PORT:-5901}" \
-  --vnc-password "${CUA_VNC_PASSWORD:-youart-agent}" \
+  --vnc-password "${CUA_VNC_PASSWORD:-agent-desktop}" \
   --log-level info
 EOF
 chmod +x /usr/local/bin/youart-start-cua-server

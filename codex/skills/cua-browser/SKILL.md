@@ -16,12 +16,11 @@ Host-facing endpoints:
 - noVNC desktop: `http://127.0.0.1:16901/`
 - CUA API: `http://127.0.0.1:28000/`
 - SSH proxy: `ssh -p 2222 agent@127.0.0.1`
-- Tailnet noVNC often works at `http://100.106.166.101:16901/` or `http://spark:16901/`
 
 Inside the LXC:
 
 - User: `agent`
-- noVNC/VNC password: `youart-agent`
+- noVNC/VNC password: `agent-desktop`
 - CUA API: `http://127.0.0.1:8000/`
 - App URL: `http://127.0.0.1:18080/`
 - Chromium wrapper: `/usr/local/bin/chromium`
@@ -112,17 +111,17 @@ Useful command names from `/commands`: `screenshot`, `get_screen_size`, `get_cur
 
 For visual bug hunts, prefer: open page in Chromium on `DISPLAY=:1`, capture screenshots with CUA, use noVNC only for supervision, and use DOM/CDP measurement only as a supplement.
 
-Mac/noVNC note: noVNC can force clipped viewport mode on macOS overlay scrollbars. Prefer opening with `#autoconnect=1&resize=scale&password=youart-agent`. If the desktop appears zoomed/panned after paste or scroll gestures, reset host browser zoom with `Cmd+0`, remote Chromium zoom with `Ctrl+0`, or use `Cmd+scroll`/remote app zoom controls.
+Mac/noVNC note: noVNC can force clipped viewport mode on macOS overlay scrollbars. Prefer opening with `#autoconnect=1&resize=scale&password=agent-desktop`. If the desktop appears zoomed/panned after paste or scroll gestures, reset host browser zoom with `Cmd+0`, remote Chromium zoom with `Ctrl+0`, or use `Cmd+scroll`/remote app zoom controls.
 
 ## Host Cuabot
 
-`cuabot` is installed persistently at `/home/jacob/.npm-global/bin/cuabot` and should already be on `PATH`.
+`cuabot` should already be on `PATH` after setup.
 
 Local runtime setup:
 
-- Config: `/home/jacob/.cuabot/settings.json`
+- Config: `~/.cuabot/settings.json`
 - Docker image `trycua/cuabot:latest` is cached.
-- Playwright Chromium for cuabot is installed in `/home/jacob/.cache/ms-playwright`.
+- Playwright Chromium for cuabot is installed in `~/.cache/ms-playwright`.
 - Xpra is available as `xpra`.
 
 Basic workflow:
@@ -137,7 +136,7 @@ cuabot --status
 2. Open a public website in sandboxed Chromium:
 
 ```bash
-cuabot --bash "chromium https://youartstudios.com >/tmp/youartstudios-chromium.log 2>&1 &"
+cuabot --bash "chromium https://example.com >/tmp/example-chromium.log 2>&1 &"
 ```
 
 For a local dev server running on the host, use `http://host.docker.internal:<port>` inside the sandbox.
@@ -171,7 +170,7 @@ If host cuabot startup fails, inspect existing state before reinstalling:
 
 ```bash
 cuabot --status
-tail -120 /home/jacob/.cuabot/server.log
+tail -120 ~/.cuabot/server.log
 docker ps --filter name=cuabot-xpra
 docker logs cuabot-xpra --tail 120
 ```
