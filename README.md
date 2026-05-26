@@ -36,12 +36,11 @@ The create script runs `scripts/sync_codex_profile_to_lxc.sh` by default. It cop
 - `memories/`
 - `skills/`
 - `hooks.json` and `hooks/`
-- `git-hooks/`
 - `auth.json` when `INCLUDE_CODEX_AUTH=yes`
 
 It intentionally skips Codex logs, caches, sqlite state, shell snapshots, and history. Repo-bundled skills live in `codex/skills/` and are installed even if the host profile does not contain them.
 
-The synced profile also installs hook-based push guards for agent shells. Codex loads `hooks.json`, and the LXC agent user gets global Git config pointing `core.hooksPath` at `~/.codex/git-hooks`. Normal Git commands are untouched; `git push` is blocked by the pre-push hook unless an operator deliberately bypasses hooks.
+The synced profile also installs Codex hook guards for agent sessions. Codex loads `hooks.json` and blocks tool-initiated pushes; normal Git commands in an interactive shell are untouched.
 
 Interactive agent shells mirror the host Codex alias:
 

@@ -67,7 +67,7 @@ sync_host_profile() {
   fi
 
   local items=()
-  for rel in config.toml hooks.json rules memories skills hooks git-hooks; do
+  for rel in config.toml hooks.json rules memories skills hooks; do
     if [ -e "${CODEX_HOME_SOURCE}/${rel}" ]; then
       items+=("${rel}")
     fi
@@ -93,7 +93,7 @@ sync_repo_codex_defaults() {
     return
   fi
 
-  for rel in hooks.json hooks git-hooks; do
+  for rel in hooks.json hooks; do
     if [ ! -e "${REPO_CODEX_DIR}/${rel}" ]; then
       continue
     fi
@@ -130,13 +130,11 @@ fix_permissions() {
     find '/home/${AGENT_USER}/.codex/skills' -type f -exec chmod 644 {} + 2>/dev/null || true
     find '/home/${AGENT_USER}/.codex/hooks' -type d -exec chmod 755 {} + 2>/dev/null || true
     find '/home/${AGENT_USER}/.codex/hooks' -type f -exec chmod 755 {} + 2>/dev/null || true
-    find '/home/${AGENT_USER}/.codex/git-hooks' -type d -exec chmod 755 {} + 2>/dev/null || true
-    find '/home/${AGENT_USER}/.codex/git-hooks' -type f -exec chmod 755 {} + 2>/dev/null || true
   "
 }
 
-install_git_hooks() {
-  log "Installing git pre-push guard for agent user"
+cleanup_legacy_git_guards() {
+  log "Cleaning up legacy Git guards"
   lxc exec "${INSTANCE}" -- bash -lc "
     if [ -L /usr/local/bin/git ] && [ \"\$(readlink /usr/local/bin/git)\" = '/home/${AGENT_USER}/.codex/bin/git' ]; then
       rm -f /usr/local/bin/git
@@ -146,8 +144,14 @@ install_git_hooks() {
       mv /usr/bin/git.real /usr/bin/git
     fi
     rm -f '/home/${AGENT_USER}/.codex/bin/git' '/home/${AGENT_USER}/.codex/bin/git-ssh'
+    rm -f '/home/${AGENT_USER}/.codex/git-hooks/pre-push'
   "
-  lxc exec "${INSTANCE}" -- runuser -u "${AGENT_USER}" -- /usr/bin/git config --global core.hooksPath "/home/${AGENT_USER}/.codex/git-hooks"
+  lxc exec "${INSTANCE}" -- runuser -u "${AGENT_USER}" -- bash -lc '
+    hooks_path="$(/usr/bin/git config --global --get core.hooksPath 2>/dev/null || true)"
+    if [ "${hooks_path}" = "${HOME}/.codex/git-hooks" ]; then
+      /usr/bin/git config --global --unset core.hooksPath
+    fi
+  '
   lxc exec "${INSTANCE}" -- runuser -u "${AGENT_USER}" -- /usr/bin/git config --global --unset core.sshCommand 2>/dev/null || true
 }
 
@@ -157,7 +161,7 @@ sync_host_profile
 sync_repo_codex_defaults
 sync_repo_skills
 fix_permissions
-install_git_hooks
+cleanup_legacy_git_guards
 append_lxc_trust
 install_codex_alias
 
