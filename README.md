@@ -236,6 +236,23 @@ Run full doctor when browser automation behavior changes:
 sandbox doctor sandbox-smoke --full
 ```
 
+To test the apt lock retry deterministically, hold the real apt lists lock in
+the VM and run update from another shell:
+
+```bash
+lxc exec sandbox-smoke -- python3 -c 'import fcntl, time; f=open("/var/lib/apt/lists/lock", "w"); fcntl.lockf(f, fcntl.LOCK_EX); print("LOCK_READY", flush=True); time.sleep(45)'
+```
+
+After `LOCK_READY` prints:
+
+```bash
+sandbox update sandbox-smoke
+```
+
+The pass condition is that install output shows `apt is busy; waiting`, then
+continues after the lock releases and quick doctor passes. Do not test this by
+deleting apt lock files or disabling Ubuntu's automatic security update jobs.
+
 Destroy only throwaway boxes, and verify exact-name confirmation:
 
 ```bash
