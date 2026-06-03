@@ -1141,7 +1141,6 @@ print_list_detail() {
   local host_alias
   host_alias="$(managed_host_alias "$name")"
 
-  printf 'managed: yes\n'
   printf 'user: %s\n\n' "$SANDBOX_USER"
   printf 'ssh:\n'
   printf '  alias: ssh %s\n' "$name"

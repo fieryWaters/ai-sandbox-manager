@@ -87,7 +87,6 @@ Use `sandbox list NAME` for the detailed access view:
 ```text
 name: youart-agent-base
 status: RUNNING
-managed: yes
 user: agent
 
 ssh:
