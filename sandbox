@@ -1,0 +1,978 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_script_path() {
+  local source="${BASH_SOURCE[0]}"
+  local dir
+  while [ -L "$source" ]; do
+    dir="$(cd -P "$(dirname "$source")" && pwd)"
+    source="$(readlink "$source")"
+    case "$source" in
+      /*) ;;
+      *) source="${dir}/${source}" ;;
+    esac
+  done
+  dir="$(cd -P "$(dirname "$source")" && pwd)"
+  printf '%s/%s\n' "$dir" "$(basename "$source")"
+}
+
+SCRIPT_PATH="$(resolve_script_path)"
+REPO_ROOT="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+DEFAULT_IMAGE="ubuntu:24.04"
+DEFAULT_USER="agent"
+DEFAULT_PORT_BASE="2230"
+DEFAULT_BIND="127.0.0.1"
+CONFIG_REL=".ai-sandbox/box.env"
+REPO_REL=".ai-sandbox/ai-sandbox-manager"
+SSH_CONFIG="${HOME}/.ssh/config"
+SSH_KEY_DIR="${HOME}/.ssh/ai-sandbox"
+
+log() { printf '[sandbox] %s\n' "$*"; }
+warn() { printf '[sandbox][warn] %s\n' "$*" >&2; }
+die() { printf '[sandbox][error] %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sandbox create NAME [--port-base N] [--user USER] [--bind ADDR]
+                         [--ssh-bind ADDR] [--novnc-bind ADDR] [--cua-bind ADDR]
+                         [--public]
+  sandbox update NAME
+  sandbox doctor NAME [--quick|--full]
+  sandbox view NAME
+  sandbox ssh NAME [-- COMMAND...]
+  sandbox status NAME
+  sandbox list
+  sandbox destroy NAME
+  sandbox help [COMMAND]
+
+Core defaults:
+  --user agent
+  --port-base first free block from 2230
+  --bind 127.0.0.1
+
+Ports are always contiguous:
+  SSH          PORT_BASE
+  noVNC        PORT_BASE + 1
+  CUA fallback PORT_BASE + 2
+
+Bind addresses:
+  127.0.0.1 keeps a service local to Spark.
+  0.0.0.0 exposes a service on all host interfaces.
+  --public is shorthand for --bind 0.0.0.0.
+
+Browser automation contract:
+  Agents use cuabot. noVNC is for humans. CUA HTTP is fallback/debug.
+EOF
+}
+
+command_help() {
+  case "${1:-}" in
+    create)
+      cat <<'EOF'
+sandbox create NAME [options]
+
+Creates an Ubuntu LXD box, writes /home/USER/.ai-sandbox/box.env,
+syncs this repo into the VM, installs managed tooling, writes SSH config,
+and runs quick doctor.
+
+Options:
+  --port-base N       Use N,N+1,N+2 for SSH,noVNC,CUA. Fails if busy.
+  --user USER         Runtime user to create. Default: agent. Create-time only.
+  --bind ADDR         Bind all host proxies to 127.0.0.1 or 0.0.0.0.
+  --ssh-bind ADDR     Bind only SSH host proxy.
+  --novnc-bind ADDR   Bind only noVNC host proxy.
+  --cua-bind ADDR     Bind only CUA fallback host proxy.
+  --public            Bind all services to 0.0.0.0.
+EOF
+      ;;
+    update)
+      cat <<'EOF'
+sandbox update NAME
+
+Repairs an existing box: syncs this checkout into the VM, regenerates
+managed proxy devices and SSH config from box.env, runs uninstall-managed,
+runs install, and then runs quick doctor. It preserves user browser/Codex
+state and does not migrate the create-time user.
+EOF
+      ;;
+    doctor)
+      cat <<'EOF'
+sandbox doctor NAME [--quick|--full]
+
+Quick is the default and checks LXD, ports, ssh NAME, noVNC, CUA /status,
+Codex login, and cuabot command surface.
+
+Full also runs direct cuabot browser smoke and a Codex-mediated browser smoke
+whose trace must show cuabot usage.
+EOF
+      ;;
+    view)
+      cat <<'EOF'
+sandbox view NAME
+
+Prints only the noVNC URL for the box.
+EOF
+      ;;
+    ssh)
+      cat <<'EOF'
+sandbox ssh NAME [-- COMMAND...]
+
+Refreshes the managed SSH config block for NAME, then opens an interactive
+SSH session or runs COMMAND through that host alias.
+EOF
+      ;;
+    status)
+      cat <<'EOF'
+sandbox status NAME
+
+Prints the recorded box config: state, SSH alias, noVNC URL, CUA fallback URL,
+and per-service bind addresses.
+EOF
+      ;;
+    list)
+      cat <<'EOF'
+sandbox list
+
+Lists current LXD instances. Managed boxes show their contiguous SSH/noVNC/CUA
+ports and bind addresses. Other LXD instances are marked unmanaged.
+EOF
+      ;;
+    destroy)
+      cat <<'EOF'
+sandbox destroy NAME
+
+Deletes the LXD instance, removes only the matching managed SSH config block,
+and removes that box's unique SSH keypair from ~/.ssh/ai-sandbox.
+
+Destroy requires typing the exact box name at the confirmation prompt.
+EOF
+      ;;
+    *)
+      usage
+      ;;
+  esac
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+validate_name() {
+  local name="$1"
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid name: ${name}"
+}
+
+validate_user() {
+  local user="$1"
+  [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "Invalid user: ${user}"
+}
+
+validate_port_base() {
+  local base="$1"
+  [[ "$base" =~ ^[0-9]+$ ]] || die "Port base must be numeric: ${base}"
+  [ "$base" -ge 1024 ] || die "Port base must be >= 1024"
+  [ "$base" -le 65533 ] || die "Port base must be <= 65533"
+}
+
+normalize_bind() {
+  local bind="$1"
+  case "$bind" in
+    localhost) printf '127.0.0.1' ;;
+    127.0.0.1|0.0.0.0) printf '%s' "$bind" ;;
+    *) die "Bind address must be 127.0.0.1, localhost, or 0.0.0.0: ${bind}" ;;
+  esac
+}
+
+ports_from_base() {
+  PORT_BASE="$1"
+  SSH_PORT="$PORT_BASE"
+  NOVNC_PORT=$((PORT_BASE + 1))
+  CUA_PORT=$((PORT_BASE + 2))
+}
+
+port_listening() {
+  local port="$1"
+  ss -H -ltn 2>/dev/null | awk -v suffix=":${port}" '$4 ~ suffix "$" { found=1 } END { exit found ? 0 : 1 }'
+}
+
+busy_port_in_block() {
+  local base="$1"
+  ports_from_base "$base"
+  local port
+  for port in "$SSH_PORT" "$NOVNC_PORT" "$CUA_PORT"; do
+    if port_listening "$port"; then
+      printf '%s' "$port"
+      return
+    fi
+  done
+}
+
+port_block_free() {
+  local base="$1"
+  [ -z "$(busy_port_in_block "$base")" ]
+}
+
+check_port_block_free() {
+  local base="$1"
+  local busy
+  busy="$(busy_port_in_block "$base")"
+  [ -z "$busy" ] || die "Port ${busy} is already listening; choose another --port-base"
+}
+
+next_port_block_start() {
+  local base="$1"
+  local next=$(( ((base / 10) + 1) * 10 ))
+  [ "$next" -ge "$DEFAULT_PORT_BASE" ] || next="$DEFAULT_PORT_BASE"
+  printf '%s' "$next"
+}
+
+find_free_port_base() {
+  local base="${1:-$DEFAULT_PORT_BASE}"
+  while [ "$base" -le 65533 ]; do
+    if ! port_listening "$base" && ! port_listening "$((base + 1))" && ! port_listening "$((base + 2))"; then
+      printf '%s' "$base"
+      return
+    fi
+    base=$((base + 10))
+  done
+  die "Could not find a free contiguous three-port block"
+}
+
+generate_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 18 | tr -d '\n'
+  else
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
+  fi
+}
+
+instance_exists() {
+  lxc info "$1" >/dev/null 2>&1
+}
+
+start_instance() {
+  lxc start "$1" >/dev/null 2>&1 || true
+}
+
+wait_for_lxc() {
+  local name="$1"
+  local tries=60
+  until lxc exec "$name" -- true >/dev/null 2>&1; do
+    tries=$((tries - 1))
+    [ "$tries" -gt 0 ] || die "Timed out waiting for ${name}"
+    sleep 1
+  done
+}
+
+box_config_path() {
+  local user="$1"
+  printf '/home/%s/%s' "$user" "$CONFIG_REL"
+}
+
+repo_dir_for_user() {
+  local user="$1"
+  printf '/home/%s/%s' "$user" "$REPO_REL"
+}
+
+read_box_env() {
+  local name="$1"
+  lxc exec "$name" -- bash -lc '
+    for path in /home/*/.ai-sandbox/box.env; do
+      if [ -f "$path" ]; then
+        cat "$path"
+        exit 0
+      fi
+    done
+    exit 1
+  ' </dev/null 2>/dev/null
+}
+
+load_box_env() {
+  local name="$1"
+  local tmp
+  tmp="$(mktemp)"
+  if ! read_box_env "$name" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  SANDBOX_USER=""
+  PORT_BASE=""
+  SSH_BIND=""
+  NOVNC_BIND=""
+  CUA_BIND=""
+  VNC_PASSWORD=""
+  local line key value
+  while IFS= read -r line; do
+    case "$line" in
+      ''|'#'*) continue ;;
+      *=*)
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+          SANDBOX_USER|PORT_BASE|SSH_BIND|NOVNC_BIND|CUA_BIND|VNC_PASSWORD)
+            printf -v "$key" '%s' "$value"
+            ;;
+        esac
+        ;;
+    esac
+  done <"$tmp"
+  rm -f "$tmp"
+
+  SANDBOX_USER="${SANDBOX_USER:-$DEFAULT_USER}"
+  PORT_BASE="${PORT_BASE:-}"
+  SSH_BIND="${SSH_BIND:-$DEFAULT_BIND}"
+  NOVNC_BIND="${NOVNC_BIND:-$DEFAULT_BIND}"
+  CUA_BIND="${CUA_BIND:-$DEFAULT_BIND}"
+  VNC_PASSWORD="${VNC_PASSWORD:-youart-agent}"
+  [ -n "$PORT_BASE" ] || return 1
+  validate_user "$SANDBOX_USER"
+  validate_port_base "$PORT_BASE"
+  SSH_BIND="$(normalize_bind "$SSH_BIND")"
+  NOVNC_BIND="$(normalize_bind "$NOVNC_BIND")"
+  CUA_BIND="$(normalize_bind "$CUA_BIND")"
+  ports_from_base "$PORT_BASE"
+}
+
+device_listen() {
+  local name="$1"
+  local device="$2"
+  lxc config device get "$name" "$device" listen 2>/dev/null || true
+}
+
+parse_listen_port() {
+  local listen="$1"
+  printf '%s' "$listen" | awk -F: '{ print $NF }'
+}
+
+parse_listen_bind() {
+  local listen="$1"
+  printf '%s' "$listen" | sed -E 's/^tcp:(.*):[0-9]+$/\1/'
+}
+
+legacy_or_new_box_env() {
+  local name="$1"
+  if load_box_env "$name"; then
+    return
+  fi
+
+  warn "No box.env found in ${name}; creating one from legacy/default state"
+  SANDBOX_USER="$DEFAULT_USER"
+  VNC_PASSWORD="youart-agent"
+  if lxc exec "$name" -- test -f /etc/youart-agent.env >/dev/null 2>&1; then
+    local legacy
+    legacy="$(lxc exec "$name" -- bash -lc 'source /etc/youart-agent.env; printf "%s\n%s\n" "${AGENT_USER:-agent}" "${VNC_PW:-youart-agent}"')"
+    SANDBOX_USER="$(printf '%s\n' "$legacy" | sed -n '1p')"
+    VNC_PASSWORD="$(printf '%s\n' "$legacy" | sed -n '2p')"
+  fi
+  validate_user "$SANDBOX_USER"
+
+  local listen
+  listen="$(device_listen "$name" ai-sandbox-ssh)"
+  [ -n "$listen" ] || listen="$(device_listen "$name" host-ssh)"
+  if [ -n "$listen" ]; then
+    PORT_BASE="$(parse_listen_port "$listen")"
+    SSH_BIND="$(normalize_bind "$(parse_listen_bind "$listen")")"
+  else
+    PORT_BASE="$(find_free_port_base "$DEFAULT_PORT_BASE")"
+    SSH_BIND="$DEFAULT_BIND"
+  fi
+  NOVNC_BIND="$DEFAULT_BIND"
+  CUA_BIND="$DEFAULT_BIND"
+  validate_port_base "$PORT_BASE"
+  ports_from_base "$PORT_BASE"
+}
+
+ensure_user() {
+  local name="$1"
+  local user="$2"
+  lxc exec "$name" -- bash -lc "
+    set -e
+    if ! id '$user' >/dev/null 2>&1; then
+      useradd -m -s /bin/bash '$user'
+    fi
+    install -d -m 700 -o '$user' -g '$user' '/home/$user/.ai-sandbox'
+    install -d -m 700 -o '$user' -g '$user' '/home/$user/.ssh'
+  "
+}
+
+write_box_env() {
+  local name="$1"
+  local user="$2"
+  local port_base="$3"
+  local vnc_password="$4"
+  local ssh_bind="$5"
+  local novnc_bind="$6"
+  local cua_bind="$7"
+  local path
+  path="$(box_config_path "$user")"
+  local content
+  content="$(cat <<EOF
+SANDBOX_USER=${user}
+PORT_BASE=${port_base}
+VNC_PASSWORD=${vnc_password}
+SSH_BIND=${ssh_bind}
+NOVNC_BIND=${novnc_bind}
+CUA_BIND=${cua_bind}
+EOF
+)"
+  printf '%s\n' "$content" | lxc exec "$name" -- bash -lc "
+    set -e
+    install -d -m 700 -o '$user' -g '$user' '/home/$user/.ai-sandbox'
+    cat > '$path'
+    chown '$user:$user' '$path'
+    chmod 600 '$path'
+  "
+}
+
+remove_device_if_present() {
+  local name="$1"
+  local device="$2"
+  if lxc config device get "$name" "$device" type >/dev/null 2>&1; then
+    lxc config device remove "$name" "$device" >/dev/null
+  fi
+}
+
+configure_base_lxd() {
+  local name="$1"
+  lxc config set "$name" security.nesting true
+  lxc config set "$name" security.syscalls.intercept.mknod true
+  lxc config set "$name" security.syscalls.intercept.setxattr true
+  lxc config set "$name" boot.autostart true
+  if ! lxc config device get "$name" ai-sandbox-gpu type >/dev/null 2>&1; then
+    lxc config device add "$name" ai-sandbox-gpu gpu >/dev/null 2>&1 || warn "GPU device not added; doctor will report GPU capability separately"
+  fi
+}
+
+configure_proxy_devices() {
+  local name="$1"
+  local ssh_bind="$2"
+  local novnc_bind="$3"
+  local cua_bind="$4"
+  local reassign_if_busy="${5:-no}"
+
+  remove_device_if_present "$name" ai-sandbox-ssh
+  remove_device_if_present "$name" ai-sandbox-novnc
+  remove_device_if_present "$name" ai-sandbox-cua
+  remove_device_if_present "$name" host-ssh
+  remove_device_if_present "$name" host-novnc
+  remove_device_if_present "$name" host-cua
+
+  local busy
+  busy="$(busy_port_in_block "$PORT_BASE")"
+  if [ -n "$busy" ]; then
+    if [ "$reassign_if_busy" = "yes" ]; then
+      local old_port_base="$PORT_BASE"
+      PORT_BASE="$(find_free_port_base "$(next_port_block_start "$PORT_BASE")")"
+      ports_from_base "$PORT_BASE"
+      warn "Port ${busy} blocked ${name}'s configured block ${old_port_base}-$((old_port_base + 2)); moved to PORT_BASE=${PORT_BASE}"
+    else
+      die "Port ${busy} is already listening; choose another --port-base"
+    fi
+  else
+    ports_from_base "$PORT_BASE"
+  fi
+
+  lxc config device add "$name" ai-sandbox-ssh proxy \
+    listen="tcp:${ssh_bind}:${SSH_PORT}" \
+    connect="tcp:127.0.0.1:22" >/dev/null
+  lxc config device add "$name" ai-sandbox-novnc proxy \
+    listen="tcp:${novnc_bind}:${NOVNC_PORT}" \
+    connect="tcp:127.0.0.1:6901" >/dev/null
+  lxc config device add "$name" ai-sandbox-cua proxy \
+    listen="tcp:${cua_bind}:${CUA_PORT}" \
+    connect="tcp:127.0.0.1:8000" >/dev/null
+}
+
+sync_repo_to_vm() {
+  local name="$1"
+  local user="$2"
+  local repo_dir
+  repo_dir="$(repo_dir_for_user "$user")"
+  log "Syncing this checkout to ${name}:${repo_dir}"
+  lxc exec "$name" -- bash -lc "
+    set -e
+    install -d -m 755 -o '$user' -g '$user' '$repo_dir'
+    find '$repo_dir' -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  "
+  tar -C "$REPO_ROOT" \
+    --exclude='.git/index.lock' \
+    --exclude='.git/objects/pack/tmp_*' \
+    --exclude='.DS_Store' \
+    -cf - . \
+    | lxc exec "$name" -- tar -C "$repo_dir" -xf -
+  lxc exec "$name" -- bash -lc "
+    chown -R '$user:$user' '/home/$user/.ai-sandbox'
+    find '$repo_dir' -type f \( -name 'sandbox' -o -name 'install.sh' -o -name 'uninstall-managed.sh' -o -path '*/scripts/*.sh' \) -exec chmod +x {} + 2>/dev/null || true
+  "
+}
+
+ensure_box_ssh_key() {
+  local name="$1"
+  local user="$2"
+  require_cmd ssh-keygen
+  mkdir -p "$SSH_KEY_DIR"
+  chmod 700 "$SSH_KEY_DIR"
+  local key_path="${SSH_KEY_DIR}/${name}_ed25519"
+  if [ ! -f "$key_path" ]; then
+    log "Generating per-box SSH key ${key_path}"
+    ssh-keygen -q -t ed25519 -N '' -C "ai-sandbox:${name}" -f "$key_path"
+  fi
+  chmod 600 "$key_path"
+  chmod 644 "${key_path}.pub"
+  lxc file push "${key_path}.pub" "$name/tmp/ai-sandbox-authorized-key.pub"
+  lxc exec "$name" -- bash -lc "
+    set -e
+    install -d -m 700 -o '$user' -g '$user' '/home/$user/.ssh'
+    touch '/home/$user/.ssh/authorized_keys'
+    awk '
+      \$0 == \"# >>> ai-sandbox ${name}\" { skip=1; next }
+      \$0 == \"# <<< ai-sandbox ${name}\" { skip=0; next }
+      !skip { print }
+    ' '/home/$user/.ssh/authorized_keys' > '/home/$user/.ssh/authorized_keys.tmp'
+    {
+      cat '/home/$user/.ssh/authorized_keys.tmp'
+      printf '%s\n' '# >>> ai-sandbox ${name}'
+      cat /tmp/ai-sandbox-authorized-key.pub
+      printf '%s\n' '# <<< ai-sandbox ${name}'
+    } > '/home/$user/.ssh/authorized_keys'
+    rm -f '/home/$user/.ssh/authorized_keys.tmp'
+    chown '$user:$user' '/home/$user/.ssh/authorized_keys'
+    chmod 600 '/home/$user/.ssh/authorized_keys'
+    rm -f /tmp/ai-sandbox-authorized-key.pub
+  "
+}
+
+sync_host_codex_profile() {
+  local name="$1"
+  local user="$2"
+  local source="${HOME}/.codex"
+  [ -d "$source" ] || return
+  local items=()
+  local rel
+  for rel in auth.json config.toml hooks.json rules memories; do
+    [ -e "$source/$rel" ] && items+=("$rel")
+  done
+  [ "${#items[@]}" -gt 0 ] || return
+  log "Importing host Codex profile files for ${user}"
+  lxc exec "$name" -- bash -lc "install -d -m 700 -o '$user' -g '$user' '/home/$user/.codex'"
+  tar -C "$source" -cf - "${items[@]}" \
+    | lxc exec "$name" -- tar -C "/home/$user/.codex" -xf -
+  lxc exec "$name" -- bash -lc "
+    chown -R '$user:$user' '/home/$user/.codex'
+    chmod 700 '/home/$user/.codex'
+    [ ! -f '/home/$user/.codex/auth.json' ] || chmod 600 '/home/$user/.codex/auth.json'
+    [ ! -f '/home/$user/.codex/config.toml' ] || chmod 600 '/home/$user/.codex/config.toml'
+  "
+}
+
+run_install() {
+  local name="$1"
+  local user="$2"
+  local uninstall_first="${3:-no}"
+  local repo_dir
+  repo_dir="$(repo_dir_for_user "$user")"
+  if [ "$uninstall_first" = "yes" ]; then
+    lxc exec "$name" -- bash -lc "cd '$repo_dir' && bash ./uninstall-managed.sh"
+  fi
+  lxc exec "$name" -- bash -lc "cd '$repo_dir' && bash ./install.sh"
+}
+
+remove_managed_ssh_block() {
+  local name="$1"
+  [ -f "$SSH_CONFIG" ] || return
+  local tmp
+  tmp="$(mktemp)"
+  awk -v name="$name" '
+    $0 == "# >>> ai-sandbox " name { skip=1; next }
+    $0 == "# <<< ai-sandbox " name { skip=0; next }
+    !skip { print }
+  ' "$SSH_CONFIG" >"$tmp"
+  cat "$tmp" >"$SSH_CONFIG"
+  rm -f "$tmp"
+}
+
+ssh_host_exists_unmanaged() {
+  local name="$1"
+  [ -f "$SSH_CONFIG" ] || return 1
+  awk -v name="$name" '
+    $0 == "# >>> ai-sandbox " name { managed=1 }
+    $0 == "# <<< ai-sandbox " name { managed=0; next }
+    managed { next }
+    /^[[:space:]]*Host[[:space:]]+/ {
+      for (i=2; i<=NF; i++) if ($i == name) found=1
+    }
+    END { exit found ? 0 : 1 }
+  ' "$SSH_CONFIG"
+}
+
+write_ssh_config() {
+  local name="$1"
+  local user="$2"
+  local port="$3"
+  local key_path="${SSH_KEY_DIR}/${name}_ed25519"
+  mkdir -p "$(dirname "$SSH_CONFIG")"
+  touch "$SSH_CONFIG"
+  chmod 600 "$SSH_CONFIG"
+  remove_managed_ssh_block "$name"
+  if ssh_host_exists_unmanaged "$name"; then
+    die "~/.ssh/config already has unmanaged Host ${name}; refusing to edit it"
+  fi
+  {
+    printf '\n# >>> ai-sandbox %s\n' "$name"
+    printf 'Host %s\n' "$name"
+    printf '  HostName 127.0.0.1\n'
+    printf '  User %s\n' "$user"
+    printf '  Port %s\n' "$port"
+    printf '  IdentityFile %s\n' "$key_path"
+    printf '  IdentitiesOnly yes\n'
+    printf '  StrictHostKeyChecking accept-new\n'
+    printf '# <<< ai-sandbox %s\n' "$name"
+  } >>"$SSH_CONFIG"
+}
+
+tcp_check() {
+  local port="$1"
+  timeout 5 bash -c "</dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1
+}
+
+doctor_quick() {
+  local name="$1"
+  local failures=0
+  local label
+  check_doctor() {
+    label="$1"
+    shift
+    printf '[doctor] %-32s' "$label"
+    if "$@" >/tmp/ai-sandbox-doctor.out 2>/tmp/ai-sandbox-doctor.err; then
+      printf ' ok\n'
+    else
+      printf ' FAIL\n' >&2
+      sed 's/^/[doctor][stderr] /' /tmp/ai-sandbox-doctor.err >&2 || true
+      failures=$((failures + 1))
+    fi
+  }
+
+  check_doctor "LXD instance" lxc info "$name"
+  check_doctor "SSH port ${SSH_PORT}" tcp_check "$SSH_PORT"
+  check_doctor "noVNC port ${NOVNC_PORT}" tcp_check "$NOVNC_PORT"
+  check_doctor "CUA port ${CUA_PORT}" tcp_check "$CUA_PORT"
+  check_doctor "ssh ${name}" ssh -o BatchMode=yes "$name" hostname
+  check_doctor "noVNC HTTP" curl -fsS "http://127.0.0.1:${NOVNC_PORT}/"
+  check_doctor "CUA status" curl -fsS "http://127.0.0.1:${CUA_PORT}/status"
+  check_doctor "VM Codex login" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "codex login status 2>&1 | grep -q 'Logged in'"
+  check_doctor "VM cuabot" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
+    set -euo pipefail
+    command -v cuabot >/dev/null
+    cuabot --help | grep -q -- "--screenshot"
+    cd "$(npm root -g)/cuabot"
+    node -e "import(\"playwright\").then(async ({ chromium }) => { const browser = await chromium.launch({ headless: true }); await browser.close(); }).catch((error) => { console.error(error.message); process.exit(1); })"
+  '
+
+  rm -f /tmp/ai-sandbox-doctor.out /tmp/ai-sandbox-doctor.err
+  [ "$failures" -eq 0 ] || die "${failures} quick doctor check(s) failed"
+}
+
+doctor_full() {
+  local name="$1"
+  doctor_quick "$name"
+  log "Running full cuabot browser smoke"
+  lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
+    set -euo pipefail
+    cd "$HOME"
+    url="data:text/html,%3C!doctype%20html%3E%3Ctitle%3Eai-sandbox%3C/title%3E%3Cbody%20style%3D%22font-family%3Asans-serif%3Bpadding%3A40px%22%3E%3Ch1%3EAI%20Sandbox%20Doctor%3C/h1%3E%3Cinput%20autofocus%20style%3D%22font-size%3A24px%3Bwidth%3A520px%22%3E%3C/body%3E"
+    cuabot --bash "pkill -x chromium || true; chromium --new-window \"$url\" >/tmp/ai-sandbox-cuabot-chromium.log 2>&1 &"
+    sleep 1
+    cuabot --screenshot /tmp/ai-sandbox-cuabot.jpg >/tmp/ai-sandbox-cuabot-screenshot.out
+    file /tmp/ai-sandbox-cuabot.jpg | grep -q "JPEG image data"
+    cuabot --click 160 160 >/tmp/ai-sandbox-cuabot-click.out
+    cuabot --type "ai sandbox doctor ok" >/tmp/ai-sandbox-cuabot-type.out
+  '
+  log "Running full Codex-mediated cuabot trace smoke"
+  lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
+    set -euo pipefail
+    cd "$HOME"
+    trace=/tmp/ai-sandbox-codex-cuabot-trace.jsonl
+    commands_json=/tmp/ai-sandbox-codex-cuabot-commands.json
+    judge_trace=/tmp/ai-sandbox-codex-cuabot-judge.jsonl
+    prompt="Read ~/.codex/skills/cua-browser/SKILL.md if present. Use cuabot to close stale Chromium windows, open a simple data URL with heading AI Sandbox Codex Doctor, take a screenshot, and report the screenshot path. Do not edit files."
+    timeout 600 codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$prompt" >"$trace" 2>&1
+    python3 - "$trace" "$commands_json" <<'"'"'PY'"'"'
+import json
+import sys
+
+commands = []
+with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        item = obj.get("item")
+        if isinstance(item, dict) and item.get("type") == "command_execution":
+            commands.append({
+                "command": item.get("command", ""),
+                "exit_code": item.get("exit_code"),
+                "status": item.get("status"),
+            })
+
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(commands, handle, indent=2)
+PY
+    commands="$(cat "$commands_json")"
+    judge_prompt="$(cat <<EOF
+You are judging whether an AI Sandbox browser-automation smoke test succeeded.
+
+The test asked a Codex agent to use the canonical cuabot browser path. Judge ONLY the executed command list below. Ignore forbidden words if they only appeared in documentation, prompts, command output, or agent narration.
+
+Return exactly one line:
+true
+or
+false
+
+Return true only if:
+- The executed commands show the agent used cuabot for browser automation.
+- The executed commands include a cuabot screenshot command, such as "cuabot --screenshot ...".
+- The executed commands do not use forbidden automation paths.
+
+Forbidden automation paths:
+- ffmpeg
+- xdotool
+- gnome-screenshot
+- noVNC as an automation API
+- raw CUA HTTP/API calls or CUA URLs/ports, including 127.0.0.1:8000 or 127.0.0.1:28000
+
+Executed commands JSON:
+$commands
+EOF
+)"
+    timeout 600 codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$judge_prompt" >"$judge_trace" 2>&1
+    python3 - "$judge_trace" <<'"'"'PY'"'"'
+import json
+import re
+import sys
+
+last_message = ""
+with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        item = obj.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            last_message = item.get("text", "")
+
+verdict = last_message.strip().lower()
+verdict = re.sub(r"^```[A-Za-z0-9_-]*\n|\n```$", "", verdict).strip()
+first_line = verdict.splitlines()[0].strip() if verdict else ""
+if first_line == "true":
+    print("[doctor] Codex trace judge             ok")
+    sys.exit(0)
+if not first_line:
+    first_line = "no verdict"
+print(f"[doctor][stderr] Codex trace judge returned {first_line!r}", file=sys.stderr)
+sys.exit(1)
+PY
+  '
+}
+
+cmd_create() {
+  require_cmd lxc
+  require_cmd ss
+  local name=""
+  local user="$DEFAULT_USER"
+  local port_base=""
+  local ssh_bind="$DEFAULT_BIND"
+  local novnc_bind="$DEFAULT_BIND"
+  local cua_bind="$DEFAULT_BIND"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --port-base) port_base="${2:-}"; shift 2 ;;
+      --user) user="${2:-}"; shift 2 ;;
+      --bind) ssh_bind="$(normalize_bind "${2:-}")"; novnc_bind="$ssh_bind"; cua_bind="$ssh_bind"; shift 2 ;;
+      --ssh-bind) ssh_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
+      --novnc-bind) novnc_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
+      --cua-bind) cua_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
+      --public) ssh_bind="0.0.0.0"; novnc_bind="0.0.0.0"; cua_bind="0.0.0.0"; shift ;;
+      -h|--help) command_help create; exit 0 ;;
+      --*) die "Unknown create option: $1" ;;
+      *) [ -z "$name" ] || die "Unexpected argument: $1"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "Missing NAME"
+  validate_name "$name"
+  validate_user "$user"
+  if [ -n "$port_base" ]; then
+    validate_port_base "$port_base"
+  else
+    port_base="$(find_free_port_base "$DEFAULT_PORT_BASE")"
+  fi
+  ports_from_base "$port_base"
+  check_port_block_free "$port_base"
+  instance_exists "$name" && die "LXD instance already exists: ${name}; use update"
+
+  log "Launching ${name} from ${DEFAULT_IMAGE}"
+  lxc launch "$DEFAULT_IMAGE" "$name"
+  start_instance "$name"
+  wait_for_lxc "$name"
+  configure_base_lxd "$name"
+  ensure_user "$name" "$user"
+  local pw
+  pw="$(generate_password)"
+  write_box_env "$name" "$user" "$port_base" "$pw" "$ssh_bind" "$novnc_bind" "$cua_bind"
+  configure_proxy_devices "$name" "$ssh_bind" "$novnc_bind" "$cua_bind"
+  sync_repo_to_vm "$name" "$user"
+  ensure_box_ssh_key "$name" "$user"
+  sync_host_codex_profile "$name" "$user"
+  run_install "$name" "$user" no
+  write_ssh_config "$name" "$user" "$SSH_PORT"
+  cmd_doctor "$name" --quick
+  log "Created ${name}"
+  printf 'SSH:   ssh %s\n' "$name"
+  printf 'noVNC: http://127.0.0.1:%s/\n' "$NOVNC_PORT"
+}
+
+cmd_update() {
+  require_cmd lxc
+  require_cmd ss
+  local name="${1:-}"
+  [ -n "$name" ] || die "Missing NAME"
+  validate_name "$name"
+  instance_exists "$name" || die "LXD instance not found: ${name}"
+  start_instance "$name"
+  wait_for_lxc "$name"
+  legacy_or_new_box_env "$name"
+  ensure_user "$name" "$SANDBOX_USER"
+  configure_base_lxd "$name"
+  configure_proxy_devices "$name" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" yes
+  write_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+  sync_repo_to_vm "$name" "$SANDBOX_USER"
+  ensure_box_ssh_key "$name" "$SANDBOX_USER"
+  run_install "$name" "$SANDBOX_USER" yes
+  write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
+  cmd_doctor "$name" --quick
+  log "Updated ${name}"
+}
+
+cmd_doctor() {
+  require_cmd lxc
+  require_cmd curl
+  local name=""
+  local mode="quick"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --quick) mode="quick"; shift ;;
+      --full) mode="full"; shift ;;
+      -h|--help) command_help doctor; exit 0 ;;
+      --*) die "Unknown doctor option: $1" ;;
+      *) [ -z "$name" ] || die "Unexpected argument: $1"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "Missing NAME"
+  validate_name "$name"
+  instance_exists "$name" || die "LXD instance not found: ${name}"
+  load_box_env "$name" || die "No box.env found; run update first"
+  write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
+  if [ "$mode" = "full" ]; then
+    doctor_full "$name"
+  else
+    doctor_quick "$name"
+  fi
+}
+
+cmd_view() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Missing NAME"
+  validate_name "$name"
+  load_box_env "$name" || die "No box.env found; run update first"
+  printf 'http://127.0.0.1:%s/\n' "$NOVNC_PORT"
+}
+
+cmd_status() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Missing NAME"
+  validate_name "$name"
+  instance_exists "$name" || die "LXD instance not found: ${name}"
+  local state
+  state="$(lxc info "$name" 2>/dev/null | awk -F: '/^Status:/ { gsub(/^ +/, "", $2); status=$2 } END { print status }')"
+  if load_box_env "$name"; then
+    printf 'name: %s\nstatus: %s\nuser: %s\nssh: ssh %s\nnovnc: http://127.0.0.1:%s/\ncua: http://127.0.0.1:%s/\n' \
+      "$name" "$state" "$SANDBOX_USER" "$name" "$NOVNC_PORT" "$CUA_PORT"
+    printf 'binds: ssh=%s novnc=%s cua=%s\n' "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+  else
+    printf 'name: %s\nstatus: %s\nbox.env: missing\n' "$name" "$state"
+  fi
+}
+
+cmd_ssh() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Missing NAME"
+  shift || true
+  validate_name "$name"
+  load_box_env "$name" || die "No box.env found; run update first"
+  write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
+  if [ "${1:-}" = "--" ]; then shift; fi
+  if [ "$#" -gt 0 ]; then
+    ssh "$name" "$@"
+  else
+    ssh "$name"
+  fi
+}
+
+cmd_list() {
+  printf '%-28s %-10s %-8s %-8s %-8s %s\n' "NAME" "STATUS" "SSH" "NOVNC" "CUA" "BIND"
+  local line name status
+  while IFS=, read -r name status _rest; do
+    [ -n "$name" ] || continue
+    if load_box_env "$name" >/dev/null 2>&1; then
+      printf '%-28s %-10s %-8s %-8s %-8s ssh=%s novnc=%s cua=%s\n' \
+        "$name" "$status" "$SSH_PORT" "$NOVNC_PORT" "$CUA_PORT" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+    else
+      printf '%-28s %-10s %-8s %-8s %-8s %s\n' "$name" "$status" "-" "-" "-" "unmanaged"
+    fi
+  done < <(lxc list --format csv -c ns)
+}
+
+cmd_destroy() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Missing NAME"
+  validate_name "$name"
+  instance_exists "$name" || die "LXD instance not found: ${name}"
+  printf 'This will permanently delete LXD instance %s and remove its managed SSH block.\n' "$name" >&2
+  printf 'Type the exact box name to continue: ' >&2
+  local answer
+  read -r answer
+  [ "$answer" = "$name" ] || die "Confirmation did not match; aborting"
+  log "Removing managed SSH config block for ${name}"
+  remove_managed_ssh_block "$name"
+  log "Removing per-box SSH keypair for ${name}"
+  rm -f "${SSH_KEY_DIR}/${name}_ed25519" "${SSH_KEY_DIR}/${name}_ed25519.pub"
+  log "Deleting LXD instance ${name}"
+  lxc delete "$name" --force
+  log "Verifying ${name} is gone"
+  if instance_exists "$name"; then
+    die "LXD instance still exists after delete: ${name}"
+  fi
+  log "Destroyed ${name}"
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    create) cmd_create "$@" ;;
+    update) cmd_update "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    view) cmd_view "$@" ;;
+    ssh) cmd_ssh "$@" ;;
+    status) cmd_status "$@" ;;
+    list) cmd_list "$@" ;;
+    destroy) cmd_destroy "$@" ;;
+    help|-h|--help) command_help "${1:-}" ;;
+    *) die "Unknown command: ${cmd}" ;;
+  esac
+}
+
+main "$@"

@@ -2,90 +2,20 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-INSTANCE="${INSTANCE:-youart-agent-base}"
-IMAGE="${IMAGE:-ubuntu:24.04}"
-PROFILE="${PROFILE:-ai-macvlan}"
-GPU_ID="${GPU_ID:-nvidia.com/gpu=0}"
-NOVNC_HOST_PORT="${NOVNC_HOST_PORT:-16901}"
-CUA_HOST_PORT="${CUA_HOST_PORT:-28000}"
-SSH_HOST_PORT="${SSH_HOST_PORT:-2222}"
-BOOTSTRAP="${BOOTSTRAP:-${SCRIPT_DIR}/bootstrap_agent_workstation.sh}"
-SYNC_CODEX_PROFILE="${SYNC_CODEX_PROFILE:-yes}"
-CODEX_SYNC_SCRIPT="${CODEX_SYNC_SCRIPT:-${SCRIPT_DIR}/sync_codex_profile_to_lxc.sh}"
+name="${INSTANCE:-youart-agent-base}"
+user="${SANDBOX_USER:-${AGENT_USER:-agent}}"
+args=(create "$name" --user "$user")
 
-log() { printf '[agent-lxc] %s\n' "$*"; }
-
-require() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    printf 'Missing required command: %s\n' "$1" >&2
-    exit 1
-  fi
-}
-
-add_device_once() {
-  local name="$1"
-  shift
-  if lxc config device get "${INSTANCE}" "${name}" type >/dev/null 2>&1; then
-    log "Device ${name} already exists"
-    return
-  fi
-  lxc config device add "${INSTANCE}" "${name}" "$@"
-}
-
-require lxc
-
-if [ ! -f "${BOOTSTRAP}" ]; then
-  printf 'Bootstrap script not found: %s\n' "${BOOTSTRAP}" >&2
-  exit 1
+if [ -n "${PORT_BASE:-}" ]; then
+  args+=(--port-base "$PORT_BASE")
+elif [ -n "${SSH_HOST_PORT:-}" ]; then
+  args+=(--port-base "$SSH_HOST_PORT")
 fi
 
-if lxc info "${INSTANCE}" >/dev/null 2>&1; then
-  log "Using existing instance ${INSTANCE}"
-else
-  log "Launching ${INSTANCE} from ${IMAGE}"
-  if [ -n "${PROFILE}" ]; then
-    lxc launch "${IMAGE}" "${INSTANCE}" --profile "${PROFILE}"
-  else
-    lxc launch "${IMAGE}" "${INSTANCE}"
-  fi
-fi
+if [ -n "${SSH_BIND:-}" ]; then args+=(--ssh-bind "$SSH_BIND"); fi
+if [ -n "${NOVNC_BIND:-}" ]; then args+=(--novnc-bind "$NOVNC_BIND"); fi
+if [ -n "${CUA_BIND:-}" ]; then args+=(--cua-bind "$CUA_BIND"); fi
 
-log "Configuring nesting, autostart, and GPU"
-lxc config set "${INSTANCE}" security.nesting true
-lxc config set "${INSTANCE}" security.syscalls.intercept.mknod true
-lxc config set "${INSTANCE}" security.syscalls.intercept.setxattr true
-lxc config set "${INSTANCE}" boot.autostart true
-add_device_once gpu0 gpu gputype=physical id="${GPU_ID}"
-
-log "Configuring host proxy ports"
-add_device_once host-novnc proxy \
-  listen="tcp:0.0.0.0:${NOVNC_HOST_PORT}" \
-  connect="tcp:127.0.0.1:6901"
-add_device_once host-cua proxy \
-  listen="tcp:0.0.0.0:${CUA_HOST_PORT}" \
-  connect="tcp:127.0.0.1:8000"
-add_device_once host-ssh proxy \
-  listen="tcp:0.0.0.0:${SSH_HOST_PORT}" \
-  connect="tcp:127.0.0.1:22"
-
-log "Starting ${INSTANCE}"
-lxc start "${INSTANCE}" >/dev/null 2>&1 || true
-
-log "Pushing and running workstation bootstrap"
-lxc file push "${BOOTSTRAP}" "${INSTANCE}/root/bootstrap_agent_workstation.sh"
-lxc exec "${INSTANCE}" -- bash /root/bootstrap_agent_workstation.sh
-
-if [ "${SYNC_CODEX_PROFILE}" = "yes" ]; then
-  if [ -x "${CODEX_SYNC_SCRIPT}" ]; then
-    log "Syncing Codex profile and repo-bundled skills"
-    INSTANCE="${INSTANCE}" AGENT_USER="agent" "${CODEX_SYNC_SCRIPT}"
-  else
-    log "Codex sync script not executable: ${CODEX_SYNC_SCRIPT}"
-  fi
-fi
-
-log "Ready"
-printf 'noVNC: http://127.0.0.1:%s/\n' "${NOVNC_HOST_PORT}"
-printf 'CUA:    http://127.0.0.1:%s/\n' "${CUA_HOST_PORT}"
-printf 'SSH:    ssh -p %s agent@127.0.0.1\n' "${SSH_HOST_PORT}"
+exec "${REPO_ROOT}/sandbox" "${args[@]}"

@@ -1,82 +1,246 @@
 # AI Sandbox Manager
 
-Utilities for building a persistent LXD/LXC workstation for browser-capable coding agents.
+Persistent LXD agent boxes that are easy to reach from Spark and easy to repair when tooling drifts.
 
-The current workstation profile creates an Ubuntu container with:
+## Contract
 
-- XFCE desktop over TigerVNC/noVNC
-- CUA computer-server exposed through a host proxy
-- Chromium with a persistent user profile
-- Codex CLI
-- Docker-in-LXC with NVIDIA GPU support
-- PyTorch Docker GPU smoke testing
-- SSH server with a host proxy for remote access
-- Selected Codex profile sync, repo-bundled skills, and host-style Codex shell alias
-
-## Create The Workstation
+Use the root CLI:
 
 ```bash
-sg lxd -c './scripts/create_agent_workstation_lxc.sh'
+sandbox create NAME [--port-base N] [--user USER]
+sandbox update NAME
+sandbox doctor NAME [--quick|--full]
+sandbox view NAME
+sandbox ssh NAME [-- command...]
+sandbox list
+sandbox status NAME
+sandbox destroy NAME
+sandbox help [COMMAND]
 ```
 
-By default this creates or updates `youart-agent-base` and exposes:
+The important invariants:
 
-- noVNC: `http://127.0.0.1:16901/`
-- CUA: `http://127.0.0.1:28000/`
-- SSH: `ssh -p 2222 agent@127.0.0.1`
+- Spark must be able to run `ssh NAME`.
+- `sandbox view NAME` prints the noVNC URL for the box.
+- `sandbox update NAME` repairs the VM tooling from this repo.
+- Agents use `cuabot` for browser automation.
+- noVNC is for human supervision only.
+- CUA HTTP is installed only as fallback/debug.
 
-The default noVNC password is `agent-desktop`.
+Before browser work, agents should close stale Chromium windows/tabs. They should not delete the persistent Chromium profile because OAuth login state is intentional.
 
-## Codex Profile Sync
+## Create
 
-The create script runs `scripts/sync_codex_profile_to_lxc.sh` by default. It copies selected Codex files from the host into `/home/agent/.codex`:
-
-- `config.toml`
-- `rules/`
-- `memories/`
-- `skills/`
-- `hooks.json` and `hooks/`
-- `auth.json` when `INCLUDE_CODEX_AUTH=yes`
-
-It intentionally skips Codex logs, caches, sqlite state, shell snapshots, and history. Repo-bundled skills live in `codex/skills/` and are installed even if the host profile does not contain them.
-
-The synced profile also installs Codex hook guards for agent sessions. Codex loads `hooks.json` and blocks tool-initiated pushes; normal Git commands in an interactive shell are untouched.
-
-Interactive agent shells mirror the host Codex alias:
+Create a box from Spark:
 
 ```bash
-alias codex='command codex --dangerously-bypass-approvals-and-sandbox'
+sandbox create agent-001 --port-base 2230
 ```
 
-Useful overrides:
+Ports are always contiguous:
+
+- SSH: `PORT_BASE`
+- noVNC: `PORT_BASE + 1`
+- CUA fallback: `PORT_BASE + 2`
+
+If any port in the block is busy, create fails before the box becomes useful.
+
+The runtime user defaults to `agent`:
 
 ```bash
-SYNC_CODEX_PROFILE=no sg lxd -c './scripts/create_agent_workstation_lxc.sh'
-INCLUDE_CODEX_AUTH=no sg lxd -c './scripts/sync_codex_profile_to_lxc.sh'
+sandbox create agent-002 --user agent --port-base 2240
 ```
 
-## Verify
+`--user` is a create-time choice. Update reads the recorded user and does not migrate home directories.
+
+## Exposure
+
+Each service has an explicit host bind address in the VM config:
 
 ```bash
-sg lxd -c './scripts/verify_agent_workstation.sh'
+SSH_BIND=127.0.0.1
+NOVNC_BIND=127.0.0.1
+CUA_BIND=127.0.0.1
 ```
 
-The verification script checks the desktop services, noVNC proxy, CUA API, Chromium profile persistence, Docker, direct GPU visibility, and PyTorch CUDA matmul inside Docker.
-
-## Useful Overrides
+Default is `127.0.0.1`, meaning exposed only on Spark localhost. Use `0.0.0.0` only when you intentionally want access from the network:
 
 ```bash
-INSTANCE=agent-001 NOVNC_HOST_PORT=16911 CUA_HOST_PORT=28010 SSH_HOST_PORT=2231 \
-  sg lxd -c './scripts/create_agent_workstation_lxc.sh'
+sandbox create agent-public --port-base 2250 --public
+sandbox create agent-mixed --port-base 2260 --ssh-bind 127.0.0.1 --novnc-bind 0.0.0.0 --cua-bind 127.0.0.1
 ```
 
-From another machine that can SSH to the host, use a jump through your host:
+## VM State
 
-```bash
-ssh -J your-host -p 2222 agent@127.0.0.1
-```
+The VM-local config is intentionally tiny:
 
 ```bash
-PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.11-py3 \
-  sg lxd -c './scripts/verify_agent_workstation.sh'
+/home/<user>/.ai-sandbox/box.env
 ```
+
+Current fields:
+
+```bash
+SANDBOX_USER=agent
+PORT_BASE=2230
+VNC_PASSWORD=<generated>
+SSH_BIND=127.0.0.1
+NOVNC_BIND=127.0.0.1
+CUA_BIND=127.0.0.1
+```
+
+Everything else is convention or generated state. The repo is synced to:
+
+```bash
+/home/<user>/.ai-sandbox/ai-sandbox-manager
+```
+
+Logs live under:
+
+```bash
+/home/<user>/.ai-sandbox/logs
+```
+
+## SSH Keys
+
+Each box gets a unique Spark-side SSH key:
+
+```bash
+~/.ssh/ai-sandbox/NAME_ed25519
+```
+
+Only that key's public half is installed into that VM. The managed SSH config block uses `IdentityFile` and `IdentitiesOnly yes`, so access to one box does not imply access to every box.
+
+The managed block in `~/.ssh/config` looks like:
+
+```sshconfig
+# >>> ai-sandbox NAME
+Host NAME
+  HostName 127.0.0.1
+  User agent
+  Port 2230
+  IdentityFile ~/.ssh/ai-sandbox/NAME_ed25519
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+# <<< ai-sandbox NAME
+```
+
+Update replaces only the matching managed block. Destroy removes the matching block and the box-specific key.
+
+## Update
+
+Update is a repair operation:
+
+```bash
+sandbox update NAME
+```
+
+It starts the VM if needed, reads `box.env`, regenerates LXD proxy devices and SSH config, syncs this checkout into the VM, runs:
+
+```bash
+./uninstall-managed.sh
+./install.sh
+```
+
+Then it runs quick doctor.
+
+If the recorded port block is no longer available after old managed proxy devices are removed, update warns and moves the box to the next free contiguous block. The final `box.env` and SSH config are rewritten to match.
+
+Update preserves:
+
+- Chromium profile and OAuth state
+- Codex auth/config
+- user SSH state
+- `git-repos`
+- `workspace`
+- `box.env`
+- logs
+
+## Doctor
+
+Quick doctor is the default:
+
+```bash
+sandbox doctor NAME
+sandbox doctor NAME --quick
+```
+
+It checks LXD, the three host ports, `ssh NAME`, noVNC HTTP, CUA `/status`, Codex login, and the cuabot command/browser dependency surface.
+
+Full doctor adds real browser automation:
+
+```bash
+sandbox doctor NAME --full
+```
+
+It runs a direct `cuabot` browser smoke and a Codex-mediated browser smoke. A second Codex pass judges the executed-command trace and must return exactly `true` or `false`; it returns `true` only when the browser work used `cuabot`, including `cuabot --screenshot`, without using ffmpeg, noVNC, xdotool, gnome-screenshot, or raw CUA.
+
+## View
+
+`view` is deliberately dumb:
+
+```bash
+sandbox view NAME
+```
+
+It prints only the noVNC URL:
+
+```text
+http://127.0.0.1:2231/
+```
+
+Use `status` or `doctor` for details.
+
+## Testing Strategy
+
+When changing this repo:
+
+Run the host CLI from a neutral directory, not from the repo checkout. This
+proves the `sandbox` command on PATH resolves the real repo root before it
+syncs files into a VM.
+
+```bash
+cd ~
+command -v sandbox
+sandbox help
+```
+
+Required smoke on a throwaway VM:
+
+```bash
+sandbox create sandbox-smoke --port-base 2250
+sandbox status sandbox-smoke
+sandbox view sandbox-smoke
+sandbox list
+sandbox ssh sandbox-smoke -- hostname
+sandbox doctor sandbox-smoke
+sandbox update sandbox-smoke
+```
+
+Verify the VM received this repo, not the PATH directory or stale files:
+
+```bash
+lxc exec sandbox-smoke -- runuser -u agent -- bash -lc \
+  'cd ~/.ai-sandbox/ai-sandbox-manager && test -f sandbox && test -f install.sh && test -f uninstall-managed.sh && ./sandbox help >/dev/null'
+```
+
+Run full doctor when browser automation behavior changes:
+
+```bash
+sandbox doctor sandbox-smoke --full
+```
+
+Destroy only throwaway boxes, and verify exact-name confirmation:
+
+```bash
+printf 'sandbox-smoke\n' | sandbox destroy sandbox-smoke
+```
+
+After the throwaway path passes, test update on the persistent known-good box:
+
+```bash
+sandbox update youart-agent-base
+sandbox doctor youart-agent-base
+```
+
+Do not destroy `youart-agent-base`.
