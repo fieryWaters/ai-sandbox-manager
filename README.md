@@ -12,8 +12,7 @@ sandbox update NAME
 sandbox doctor NAME [--quick|--full]
 sandbox view NAME
 sandbox ssh NAME [-- command...]
-sandbox list
-sandbox status NAME
+sandbox list [NAME]
 sandbox destroy NAME
 sandbox help [COMMAND]
 ```
@@ -70,25 +69,42 @@ sandbox create agent-public --port-base 2250 --public
 sandbox create agent-mixed --port-base 2260 --ssh-bind 127.0.0.1 --novnc-bind 0.0.0.0 --cua-bind 127.0.0.1
 ```
 
-`sandbox list` turns those binds into usable access addresses. A service bound
-to `127.0.0.1` shows only local access. A service bound to `0.0.0.0` shows
-local access plus useful host interfaces, including Tailscale when `tailscale0`
-is present:
+`sandbox list` turns those binds into a compact fleet view. A service bound to
+`127.0.0.1` is local. A service bound to `0.0.0.0` shows useful host
+interfaces, including Tailscale when `tailscale0` is present:
 
 ```text
-youart-agent-base            RUNNING    managed
-  ssh:   ssh youart-agent-base (127.0.0.1:2230)
-         ssh -p 2230 agent@192.168.1.71 (enP7s7)
-         ssh -p 2230 agent@100.106.166.101 (tailscale0)
-  noVNC: http://127.0.0.1:2231/
-         http://192.168.1.71:2231/ (enP7s7)
-         http://100.106.166.101:2231/ (tailscale0)
-  CUA:   http://127.0.0.1:2232/
+NAME                         STATUS     SSH                      NOVNC                        EXPOSURE
+youart-agent-base            RUNNING    ssh youart-agent-base    http://127.0.0.1:2231/       ssh,noVNC on enP7s7,tailscale0
 ```
 
 The list output reads the current LXD proxy devices when available, then falls
 back to `box.env`. It intentionally filters noisy internal bridge interfaces
 such as Docker and LXD bridges.
+
+Use `sandbox list NAME` for the detailed access view:
+
+```text
+name: youart-agent-base
+status: RUNNING
+managed: yes
+user: agent
+
+ssh:
+  alias: ssh youart-agent-base
+  private key path: /home/jacob/.ssh/ai-sandbox/youart-agent-base_ed25519
+  known hosts: /home/jacob/.ssh/ai-sandbox/known_hosts
+  host key alias: ai-sandbox-youart-agent-base
+  local: ssh youart-agent-base (127.0.0.1:2230)
+  tailscale0: ssh -i /home/jacob/.ssh/ai-sandbox/youart-agent-base_ed25519 -p 2230 agent@100.106.166.101
+
+noVNC:
+  local: http://127.0.0.1:2231/
+  tailscale0: http://100.106.166.101:2231/
+```
+
+The detailed view prints paths and ready-to-copy commands. It does not print
+private key contents or the public key.
 
 ## VM State
 
@@ -225,7 +241,7 @@ It prints only the noVNC URL:
 http://127.0.0.1:2231/
 ```
 
-Use `status` or `doctor` for details.
+Use `sandbox list NAME` or `doctor` for details.
 
 ## Testing Strategy
 
@@ -245,7 +261,7 @@ Required smoke on a throwaway VM:
 
 ```bash
 sandbox create sandbox-smoke --port-base 2250
-sandbox status sandbox-smoke
+sandbox list sandbox-smoke
 sandbox view sandbox-smoke
 sandbox list
 sandbox ssh sandbox-smoke -- hostname

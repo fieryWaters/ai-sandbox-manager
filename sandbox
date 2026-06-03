@@ -43,8 +43,7 @@ Usage:
   sandbox doctor NAME [--quick|--full]
   sandbox view NAME
   sandbox ssh NAME [-- COMMAND...]
-  sandbox status NAME
-  sandbox list
+  sandbox list [NAME]
   sandbox destroy NAME
   sandbox help [COMMAND]
 
@@ -126,23 +125,15 @@ SSH session or runs COMMAND through that host alias. Managed hosts use
 ports do not collide with global SSH known-hosts entries.
 EOF
       ;;
-    status)
-      cat <<'EOF'
-sandbox status NAME
-
-Prints the recorded box config: state, SSH alias, noVNC URL, CUA fallback URL,
-and per-service bind addresses.
-EOF
-      ;;
     list)
       cat <<'EOF'
-sandbox list
+sandbox list [NAME]
 
-Lists current LXD instances. Managed boxes show the SSH, noVNC, and CUA
-addresses that match their current LXD proxy binds. Services bound to
-127.0.0.1 show only local access; services bound to 0.0.0.0 also show useful
-host interfaces such as LAN and tailscale0. Other LXD instances are marked
-unmanaged.
+Without NAME, prints a compact overview of current LXD instances.
+
+With NAME, prints the detailed access view for one box: user, private key path,
+known-host alias, SSH commands, noVNC URLs, CUA URLs, ports, and bind addresses.
+It does not print private key contents.
 EOF
       ;;
     destroy)
@@ -257,6 +248,10 @@ generate_password() {
 
 instance_exists() {
   lxc info "$1" >/dev/null 2>&1
+}
+
+instance_status() {
+  lxc info "$1" 2>/dev/null | awk -F: '/^Status:/ { gsub(/^ +/, "", $2); status=$2 } END { print status }'
 }
 
 start_instance() {
@@ -981,22 +976,6 @@ cmd_view() {
   printf 'http://127.0.0.1:%s/\n' "$NOVNC_PORT"
 }
 
-cmd_status() {
-  local name="${1:-}"
-  [ -n "$name" ] || die "Missing NAME"
-  validate_name "$name"
-  instance_exists "$name" || die "LXD instance not found: ${name}"
-  local state
-  state="$(lxc info "$name" 2>/dev/null | awk -F: '/^Status:/ { gsub(/^ +/, "", $2); status=$2 } END { print status }')"
-  if load_box_env "$name"; then
-    printf 'name: %s\nstatus: %s\nuser: %s\nssh: ssh %s\nnovnc: http://127.0.0.1:%s/\ncua: http://127.0.0.1:%s/\n' \
-      "$name" "$state" "$SANDBOX_USER" "$name" "$NOVNC_PORT" "$CUA_PORT"
-    printf 'binds: ssh=%s novnc=%s cua=%s\n' "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
-  else
-    printf 'name: %s\nstatus: %s\nbox.env: missing\n' "$name" "$state"
-  fi
-}
-
 cmd_ssh() {
   local name="${1:-}"
   [ -n "$name" ] || die "Missing NAME"
@@ -1012,67 +991,192 @@ cmd_ssh() {
   fi
 }
 
-print_ssh_access() {
+network_labels_csv() {
+  local bind="$1"
+  local label addr out=""
+  while read -r label addr; do
+    [ -n "$label" ] || continue
+    [ "$addr" = "127.0.0.1" ] && continue
+    if [ -z "$out" ]; then
+      out="$label"
+    else
+      out="${out},${label}"
+    fi
+  done < <(service_hosts_for_bind "$bind")
+  printf '%s' "$out"
+}
+
+summarize_exposure() {
+  local ssh_bind="$1"
+  local novnc_bind="$2"
+  local cua_bind="$3"
+  local service bind labels first label service_csv out pair
+  local -a services=()
+  local -a label_sets=()
+
+  for service in ssh noVNC CUA; do
+    case "$service" in
+      ssh) bind="$ssh_bind" ;;
+      noVNC) bind="$novnc_bind" ;;
+      CUA) bind="$cua_bind" ;;
+    esac
+    labels="$(network_labels_csv "$bind")"
+    if [ -n "$labels" ]; then
+      services+=("$service")
+      label_sets+=("$labels")
+    fi
+  done
+
+  if [ "${#services[@]}" -eq 0 ]; then
+    printf 'local'
+    return
+  fi
+
+  first="${label_sets[0]}"
+  for label in "${label_sets[@]}"; do
+    if [ "$label" != "$first" ]; then
+      out=""
+      for service in "${!services[@]}"; do
+        pair="${services[$service]} on ${label_sets[$service]}"
+        if [ -z "$out" ]; then
+          out="$pair"
+        else
+          out="${out}; ${pair}"
+        fi
+      done
+      printf '%s' "$out"
+      return
+    fi
+  done
+
+  service_csv="$(IFS=,; printf '%s' "${services[*]}")"
+  printf '%s on %s' "$service_csv" "$first"
+}
+
+first_service_addr() {
+  local bind="$1"
+  local label addr
+  while read -r label addr; do
+    [ -n "$label" ] || continue
+    printf '%s' "$addr"
+    return
+  done < <(service_hosts_for_bind "$bind")
+}
+
+print_ssh_detail() {
   local name="$1"
   local user="$2"
   local bind="$3"
   local port="$4"
-  local label addr prefix
-  local first="yes"
+  local key_path="$5"
+  local label addr
   while read -r label addr; do
     [ -n "$label" ] || continue
-    if [ "$first" = "yes" ]; then
-      prefix="  ssh:   "
-      first="no"
-    else
-      prefix="         "
-    fi
     if [ "$addr" = "127.0.0.1" ]; then
-      printf '%sssh %s (%s:%s)\n' "$prefix" "$name" "$addr" "$port"
+      printf '  local: %s (%s:%s)\n' "ssh $name" "$addr" "$port"
     else
-      printf '%sssh -p %s %s@%s (%s)\n' "$prefix" "$port" "$user" "$addr" "$label"
+      printf '  %s: ssh -i %s -p %s %s@%s\n' "$label" "$key_path" "$port" "$user" "$addr"
     fi
   done < <(service_hosts_for_bind "$bind")
 }
 
-print_url_access() {
-  local title="$1"
-  local bind="$2"
-  local port="$3"
-  local label addr prefix
-  local first="yes"
+print_url_detail() {
+  local bind="$1"
+  local port="$2"
+  local label addr
   while read -r label addr; do
     [ -n "$label" ] || continue
-    if [ "$first" = "yes" ]; then
-      prefix="$(printf '  %-6s ' "${title}:")"
-      first="no"
-    else
-      prefix="         "
-    fi
-    if [ "$addr" = "127.0.0.1" ]; then
-      printf '%shttp://%s:%s/\n' "$prefix" "$addr" "$port"
-    else
-      printf '%shttp://%s:%s/ (%s)\n' "$prefix" "$addr" "$port" "$label"
-    fi
+    printf '  %s: http://%s:%s/\n' "$label" "$addr" "$port"
   done < <(service_hosts_for_bind "$bind")
+}
+
+print_list_row() {
+  local name="$1"
+  local status="$2"
+  if load_box_env "$name" >/dev/null 2>&1; then
+    effective_proxy "$name" ai-sandbox-ssh host-ssh "$SSH_BIND" "$SSH_PORT"
+    local ssh_bind="$EFFECTIVE_BIND"
+    local ssh_port="$EFFECTIVE_PORT"
+    effective_proxy "$name" ai-sandbox-novnc host-novnc "$NOVNC_BIND" "$NOVNC_PORT"
+    local novnc_bind="$EFFECTIVE_BIND"
+    local novnc_port="$EFFECTIVE_PORT"
+    effective_proxy "$name" ai-sandbox-cua host-cua "$CUA_BIND" "$CUA_PORT"
+    local cua_bind="$EFFECTIVE_BIND"
+    local cua_port="$EFFECTIVE_PORT"
+    local novnc_host exposure
+    novnc_host="$(first_service_addr "$novnc_bind")"
+    exposure="$(summarize_exposure "$ssh_bind" "$novnc_bind" "$cua_bind")"
+    printf '%-28s %-10s %-24s %-28s %s\n' \
+      "$name" "$status" "ssh $name" "http://${novnc_host}:${novnc_port}/" "$exposure"
+  else
+    printf '%-28s %-10s %-24s %-28s %s\n' "$name" "$status" "-" "-" "unmanaged"
+  fi
+}
+
+print_list_detail() {
+  local name="$1"
+  validate_name "$name"
+  instance_exists "$name" || die "LXD instance not found: ${name}"
+  local status
+  status="$(instance_status "$name")"
+
+  printf 'name: %s\n' "$name"
+  printf 'status: %s\n' "$status"
+  if ! load_box_env "$name" >/dev/null 2>&1; then
+    printf 'managed: no\n'
+    printf 'box.env: missing\n'
+    return
+  fi
+
+  effective_proxy "$name" ai-sandbox-ssh host-ssh "$SSH_BIND" "$SSH_PORT"
+  local ssh_bind="$EFFECTIVE_BIND"
+  local ssh_port="$EFFECTIVE_PORT"
+  effective_proxy "$name" ai-sandbox-novnc host-novnc "$NOVNC_BIND" "$NOVNC_PORT"
+  local novnc_bind="$EFFECTIVE_BIND"
+  local novnc_port="$EFFECTIVE_PORT"
+  effective_proxy "$name" ai-sandbox-cua host-cua "$CUA_BIND" "$CUA_PORT"
+  local cua_bind="$EFFECTIVE_BIND"
+  local cua_port="$EFFECTIVE_PORT"
+  local key_path="${SSH_KEY_DIR}/${name}_ed25519"
+  local host_alias
+  host_alias="$(managed_host_alias "$name")"
+
+  printf 'managed: yes\n'
+  printf 'user: %s\n\n' "$SANDBOX_USER"
+  printf 'ssh:\n'
+  printf '  alias: ssh %s\n' "$name"
+  printf '  private key path: %s\n' "$key_path"
+  printf '  known hosts: %s\n' "$SSH_KNOWN_HOSTS"
+  printf '  host key alias: %s\n' "$host_alias"
+  print_ssh_detail "$name" "$SANDBOX_USER" "$ssh_bind" "$ssh_port" "$key_path"
+  printf '\nnoVNC:\n'
+  print_url_detail "$novnc_bind" "$novnc_port"
+  printf '\nCUA:\n'
+  print_url_detail "$cua_bind" "$cua_port"
+  printf '\nconfig:\n'
+  printf '  ports: ssh=%s novnc=%s cua=%s\n' "$ssh_port" "$novnc_port" "$cua_port"
+  printf '  binds: ssh=%s novnc=%s cua=%s\n' "$ssh_bind" "$novnc_bind" "$cua_bind"
 }
 
 cmd_list() {
-  printf '%-28s %-10s %s\n' "NAME" "STATUS" "ACCESS"
+  if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    command_help list
+    exit 0
+  fi
+  [ "$#" -le 1 ] || die "Unexpected argument: $2"
+  if [ "$#" -eq 1 ]; then
+    case "$1" in
+      --*) die "Unknown list option: $1" ;;
+    esac
+    print_list_detail "$1"
+    return
+  fi
+
+  printf '%-28s %-10s %-24s %-28s %s\n' "NAME" "STATUS" "SSH" "NOVNC" "EXPOSURE"
   local line name status
   while IFS=, read -r name status _rest; do
     [ -n "$name" ] || continue
-    if load_box_env "$name" >/dev/null 2>&1; then
-      printf '%-28s %-10s managed\n' "$name" "$status"
-      effective_proxy "$name" ai-sandbox-ssh host-ssh "$SSH_BIND" "$SSH_PORT"
-      print_ssh_access "$name" "$SANDBOX_USER" "$EFFECTIVE_BIND" "$EFFECTIVE_PORT"
-      effective_proxy "$name" ai-sandbox-novnc host-novnc "$NOVNC_BIND" "$NOVNC_PORT"
-      print_url_access "noVNC" "$EFFECTIVE_BIND" "$EFFECTIVE_PORT"
-      effective_proxy "$name" ai-sandbox-cua host-cua "$CUA_BIND" "$CUA_PORT"
-      print_url_access "CUA" "$EFFECTIVE_BIND" "$EFFECTIVE_PORT"
-    else
-      printf '%-28s %-10s unmanaged\n' "$name" "$status"
-    fi
+    print_list_row "$name" "$status"
   done < <(lxc list --format csv -c ns)
 }
 
@@ -1110,7 +1214,6 @@ main() {
     doctor) cmd_doctor "$@" ;;
     view) cmd_view "$@" ;;
     ssh) cmd_ssh "$@" ;;
-    status) cmd_status "$@" ;;
     list) cmd_list "$@" ;;
     destroy) cmd_destroy "$@" ;;
     help|-h|--help) command_help "${1:-}" ;;
