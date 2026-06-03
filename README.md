@@ -111,6 +111,14 @@ Each box gets a unique Spark-side SSH key:
 
 Only that key's public half is installed into that VM. The managed SSH config block uses `IdentityFile` and `IdentitiesOnly yes`, so access to one box does not imply access to every box.
 
+Managed host keys also stay in the sandbox SSH directory:
+
+```bash
+~/.ssh/ai-sandbox/known_hosts
+```
+
+Each box uses `HostKeyAlias ai-sandbox-NAME`, so reused localhost ports do not collide with stale global `~/.ssh/known_hosts` entries.
+
 The managed block in `~/.ssh/config` looks like:
 
 ```sshconfig
@@ -121,11 +129,13 @@ Host NAME
   Port 2230
   IdentityFile ~/.ssh/ai-sandbox/NAME_ed25519
   IdentitiesOnly yes
+  UserKnownHostsFile ~/.ssh/ai-sandbox/known_hosts
+  HostKeyAlias ai-sandbox-NAME
   StrictHostKeyChecking accept-new
 # <<< ai-sandbox NAME
 ```
 
-Update replaces only the matching managed block. Destroy removes the matching block and the box-specific key.
+Update replaces only the matching managed block. Destroy removes the matching block, the box-specific key, and the matching `ai-sandbox-NAME` known-hosts entry.
 
 ## Update
 

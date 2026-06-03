@@ -27,6 +27,7 @@ CONFIG_REL=".ai-sandbox/box.env"
 REPO_REL=".ai-sandbox/ai-sandbox-manager"
 SSH_CONFIG="${HOME}/.ssh/config"
 SSH_KEY_DIR="${HOME}/.ssh/ai-sandbox"
+SSH_KNOWN_HOSTS="${SSH_KEY_DIR}/known_hosts"
 
 log() { printf '[sandbox] %s\n' "$*"; }
 warn() { printf '[sandbox][warn] %s\n' "$*" >&2; }
@@ -120,7 +121,9 @@ EOF
 sandbox ssh NAME [-- COMMAND...]
 
 Refreshes the managed SSH config block for NAME, then opens an interactive
-SSH session or runs COMMAND through that host alias.
+SSH session or runs COMMAND through that host alias. Managed hosts use
+~/.ssh/ai-sandbox/known_hosts with a per-box HostKeyAlias, so reused localhost
+ports do not collide with global SSH known-hosts entries.
 EOF
       ;;
     status)
@@ -144,7 +147,8 @@ EOF
 sandbox destroy NAME
 
 Deletes the LXD instance, removes only the matching managed SSH config block,
-and removes that box's unique SSH keypair from ~/.ssh/ai-sandbox.
+removes that box's unique SSH keypair from ~/.ssh/ai-sandbox, and removes
+that box's managed known-hosts entry.
 
 Destroy requires typing the exact box name at the confirmation prompt.
 EOF
@@ -593,6 +597,18 @@ remove_managed_ssh_block() {
   rm -f "$tmp"
 }
 
+managed_host_alias() {
+  printf 'ai-sandbox-%s' "$1"
+}
+
+remove_managed_known_host() {
+  local name="$1"
+  local host_alias
+  host_alias="$(managed_host_alias "$name")"
+  [ -f "$SSH_KNOWN_HOSTS" ] || return
+  ssh-keygen -f "$SSH_KNOWN_HOSTS" -R "$host_alias" >/dev/null 2>&1 || true
+}
+
 ssh_host_exists_unmanaged() {
   local name="$1"
   [ -f "$SSH_CONFIG" ] || return 1
@@ -612,9 +628,15 @@ write_ssh_config() {
   local user="$2"
   local port="$3"
   local key_path="${SSH_KEY_DIR}/${name}_ed25519"
+  local host_alias
+  host_alias="$(managed_host_alias "$name")"
   mkdir -p "$(dirname "$SSH_CONFIG")"
+  mkdir -p "$SSH_KEY_DIR"
+  chmod 700 "$SSH_KEY_DIR"
   touch "$SSH_CONFIG"
   chmod 600 "$SSH_CONFIG"
+  touch "$SSH_KNOWN_HOSTS"
+  chmod 600 "$SSH_KNOWN_HOSTS"
   remove_managed_ssh_block "$name"
   if ssh_host_exists_unmanaged "$name"; then
     die "~/.ssh/config already has unmanaged Host ${name}; refusing to edit it"
@@ -627,6 +649,8 @@ write_ssh_config() {
     printf '  Port %s\n' "$port"
     printf '  IdentityFile %s\n' "$key_path"
     printf '  IdentitiesOnly yes\n'
+    printf '  UserKnownHostsFile %s\n' "$SSH_KNOWN_HOSTS"
+    printf '  HostKeyAlias %s\n' "$host_alias"
     printf '  StrictHostKeyChecking accept-new\n'
     printf '# <<< ai-sandbox %s\n' "$name"
   } >>"$SSH_CONFIG"
@@ -940,13 +964,15 @@ cmd_destroy() {
   [ -n "$name" ] || die "Missing NAME"
   validate_name "$name"
   instance_exists "$name" || die "LXD instance not found: ${name}"
-  printf 'This will permanently delete LXD instance %s and remove its managed SSH block.\n' "$name" >&2
+  printf 'This will permanently delete LXD instance %s and remove its managed SSH config, known-host entry, and keypair.\n' "$name" >&2
   printf 'Type the exact box name to continue: ' >&2
   local answer
   read -r answer
   [ "$answer" = "$name" ] || die "Confirmation did not match; aborting"
   log "Removing managed SSH config block for ${name}"
   remove_managed_ssh_block "$name"
+  log "Removing managed SSH known-host entry for ${name}"
+  remove_managed_known_host "$name"
   log "Removing per-box SSH keypair for ${name}"
   rm -f "${SSH_KEY_DIR}/${name}_ed25519" "${SSH_KEY_DIR}/${name}_ed25519.pub"
   log "Deleting LXD instance ${name}"
