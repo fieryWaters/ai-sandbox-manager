@@ -70,6 +70,26 @@ sandbox create agent-public --port-base 2250 --public
 sandbox create agent-mixed --port-base 2260 --ssh-bind 127.0.0.1 --novnc-bind 0.0.0.0 --cua-bind 127.0.0.1
 ```
 
+`sandbox list` turns those binds into usable access addresses. A service bound
+to `127.0.0.1` shows only local access. A service bound to `0.0.0.0` shows
+local access plus useful host interfaces, including Tailscale when `tailscale0`
+is present:
+
+```text
+youart-agent-base            RUNNING    managed
+  ssh:   ssh youart-agent-base (127.0.0.1:2230)
+         ssh -p 2230 agent@192.168.1.71 (enP7s7)
+         ssh -p 2230 agent@100.106.166.101 (tailscale0)
+  noVNC: http://127.0.0.1:2231/
+         http://192.168.1.71:2231/ (enP7s7)
+         http://100.106.166.101:2231/ (tailscale0)
+  CUA:   http://127.0.0.1:2232/
+```
+
+The list output reads the current LXD proxy devices when available, then falls
+back to `box.env`. It intentionally filters noisy internal bridge interfaces
+such as Docker and LXD bridges.
+
 ## VM State
 
 The VM-local config is intentionally tiny:

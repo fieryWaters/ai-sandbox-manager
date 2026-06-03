@@ -138,8 +138,11 @@ EOF
       cat <<'EOF'
 sandbox list
 
-Lists current LXD instances. Managed boxes show their contiguous SSH/noVNC/CUA
-ports and bind addresses. Other LXD instances are marked unmanaged.
+Lists current LXD instances. Managed boxes show the SSH, noVNC, and CUA
+addresses that match their current LXD proxy binds. Services bound to
+127.0.0.1 show only local access; services bound to 0.0.0.0 also show useful
+host interfaces such as LAN and tailscale0. Other LXD instances are marked
+unmanaged.
 EOF
       ;;
     destroy)
@@ -353,6 +356,70 @@ parse_listen_port() {
 parse_listen_bind() {
   local listen="$1"
   printf '%s' "$listen" | sed -E 's/^tcp:(.*):[0-9]+$/\1/'
+}
+
+host_network_interfaces() {
+  command -v ip >/dev/null 2>&1 || return
+  ip -o -4 addr show scope global up 2>/dev/null | awk '
+    function useful_interface(name) {
+      return name !~ /^(lo$|docker|br-|lxdbr|incusbr|virbr|veth|cni|flannel|kube|podman)/
+    }
+    {
+      name = $2
+      sub(/:$/, "", name)
+      split($4, addr, "/")
+      if (useful_interface(name) && !seen[addr[1]]++) {
+        print name, addr[1]
+      }
+    }
+  '
+}
+
+interface_label_for_ip() {
+  local ipaddr="$1"
+  local label addr
+  while read -r label addr; do
+    [ -n "$label" ] || continue
+    if [ "$addr" = "$ipaddr" ]; then
+      printf '%s' "$label"
+      return
+    fi
+  done < <(host_network_interfaces)
+}
+
+service_hosts_for_bind() {
+  local bind="$1"
+  local label
+  case "$bind" in
+    127.0.0.1|localhost)
+      printf 'local 127.0.0.1\n'
+      ;;
+    0.0.0.0)
+      printf 'local 127.0.0.1\n'
+      host_network_interfaces
+      ;;
+    *)
+      label="$(interface_label_for_ip "$bind")"
+      printf '%s %s\n' "${label:-host}" "$bind"
+      ;;
+  esac
+}
+
+effective_proxy() {
+  local name="$1"
+  local primary_device="$2"
+  local legacy_device="$3"
+  local fallback_bind="$4"
+  local fallback_port="$5"
+  EFFECTIVE_BIND="$fallback_bind"
+  EFFECTIVE_PORT="$fallback_port"
+  local listen
+  listen="$(device_listen "$name" "$primary_device")"
+  [ -n "$listen" ] || listen="$(device_listen "$name" "$legacy_device")"
+  if [ -n "$listen" ]; then
+    EFFECTIVE_BIND="$(parse_listen_bind "$listen")"
+    EFFECTIVE_PORT="$(parse_listen_port "$listen")"
+  fi
 }
 
 legacy_or_new_box_env() {
@@ -945,16 +1012,66 @@ cmd_ssh() {
   fi
 }
 
+print_ssh_access() {
+  local name="$1"
+  local user="$2"
+  local bind="$3"
+  local port="$4"
+  local label addr prefix
+  local first="yes"
+  while read -r label addr; do
+    [ -n "$label" ] || continue
+    if [ "$first" = "yes" ]; then
+      prefix="  ssh:   "
+      first="no"
+    else
+      prefix="         "
+    fi
+    if [ "$addr" = "127.0.0.1" ]; then
+      printf '%sssh %s (%s:%s)\n' "$prefix" "$name" "$addr" "$port"
+    else
+      printf '%sssh -p %s %s@%s (%s)\n' "$prefix" "$port" "$user" "$addr" "$label"
+    fi
+  done < <(service_hosts_for_bind "$bind")
+}
+
+print_url_access() {
+  local title="$1"
+  local bind="$2"
+  local port="$3"
+  local label addr prefix
+  local first="yes"
+  while read -r label addr; do
+    [ -n "$label" ] || continue
+    if [ "$first" = "yes" ]; then
+      prefix="$(printf '  %-6s ' "${title}:")"
+      first="no"
+    else
+      prefix="         "
+    fi
+    if [ "$addr" = "127.0.0.1" ]; then
+      printf '%shttp://%s:%s/\n' "$prefix" "$addr" "$port"
+    else
+      printf '%shttp://%s:%s/ (%s)\n' "$prefix" "$addr" "$port" "$label"
+    fi
+  done < <(service_hosts_for_bind "$bind")
+}
+
 cmd_list() {
-  printf '%-28s %-10s %-8s %-8s %-8s %s\n' "NAME" "STATUS" "SSH" "NOVNC" "CUA" "BIND"
+  printf '%-28s %-10s %s\n' "NAME" "STATUS" "ACCESS"
   local line name status
   while IFS=, read -r name status _rest; do
     [ -n "$name" ] || continue
     if load_box_env "$name" >/dev/null 2>&1; then
-      printf '%-28s %-10s %-8s %-8s %-8s ssh=%s novnc=%s cua=%s\n' \
-        "$name" "$status" "$SSH_PORT" "$NOVNC_PORT" "$CUA_PORT" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+      printf '%-28s %-10s managed\n' "$name" "$status"
+      effective_proxy "$name" ai-sandbox-ssh host-ssh "$SSH_BIND" "$SSH_PORT"
+      print_ssh_access "$name" "$SANDBOX_USER" "$EFFECTIVE_BIND" "$EFFECTIVE_PORT"
+      effective_proxy "$name" ai-sandbox-novnc host-novnc "$NOVNC_BIND" "$NOVNC_PORT"
+      print_url_access "noVNC" "$EFFECTIVE_BIND" "$EFFECTIVE_PORT"
+      effective_proxy "$name" ai-sandbox-cua host-cua "$CUA_BIND" "$CUA_PORT"
+      print_url_access "CUA" "$EFFECTIVE_BIND" "$EFFECTIVE_PORT"
     else
-      printf '%-28s %-10s %-8s %-8s %-8s %s\n' "$name" "$status" "-" "-" "-" "unmanaged"
+      printf '%-28s %-10s unmanaged\n' "$name" "$status"
     fi
   done < <(lxc list --format csv -c ns)
 }
