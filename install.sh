@@ -134,8 +134,9 @@ apt_get install -y \
   sudo jq unzip zip net-tools netcat-openbsd xdg-utils dbus-x11 x11-utils xterm \
   openssh-server \
   xfce4 xfce4-terminal tigervnc-standalone-server tigervnc-common \
-  xclip wmctrl xpra file \
+  xclip wmctrl xdotool netpbm file \
   python3 python3-dev python3-venv python3-pip python3-tk build-essential \
+  python3-pil \
   nodejs docker.io docker-compose-v2
 
 usermod -aG sudo,docker "$SANDBOX_USER" || usermod -aG sudo "$SANDBOX_USER"
@@ -177,26 +178,9 @@ python3 -m venv /opt/cua-computer-server
 /opt/cua-computer-server/bin/pip install --upgrade pip setuptools wheel
 /opt/cua-computer-server/bin/pip install 'cua-computer-server[vnc]'
 
-log "Installing Codex, Playwright, and cuabot"
-npm install -g @openai/codex playwright cuabot@latest
+log "Installing Codex and Playwright"
+npm install -g @openai/codex playwright
 PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install --with-deps chromium
-
-runuser -u "$SANDBOX_USER" -- bash -lc '
-  install -d -m 700 "$HOME/.cuabot"
-  cat > "$HOME/.cuabot/settings.json" <<EOF
-{
-  "telemetryEnabled": false,
-  "aliasIgnored": true
-}
-EOF
-  chmod 600 "$HOME/.cuabot/settings.json"
-  cuabot_root="$(npm root -g)/cuabot"
-  if [ -x "${cuabot_root}/node_modules/.bin/playwright" ]; then
-    "${cuabot_root}/node_modules/.bin/playwright" install chromium || true
-  elif command -v playwright >/dev/null 2>&1; then
-    playwright install chromium || true
-  fi
-'
 
 cat >/usr/local/bin/chromium <<'EOF'
 #!/usr/bin/env bash
@@ -218,6 +202,222 @@ EOF
 chmod +x /usr/local/bin/chromium
 update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/chromium 100
 update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser /usr/local/bin/chromium 100
+
+cat >/usr/local/bin/cuabot <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DISPLAY="${CUABOT_DISPLAY:-:1}"
+if [ -z "${XAUTHORITY:-}" ] && [ -f "$HOME/.Xauthority" ]; then
+  export XAUTHORITY="$HOME/.Xauthority"
+fi
+
+usage() {
+  cat <<'USAGE'
+cuabot - native AI Sandbox desktop controller
+
+Commands:
+  --status                  Check the native desktop
+  --reset                   Close stale Chromium windows on the native desktop
+  --bash <command>          Run a shell command with DISPLAY set to the native desktop
+  --screenshot [path]       Save a JPEG screenshot of the native desktop
+  --click x y [button]      Click at coordinates
+  --doubleclick x y         Double-click at coordinates
+  --move x y                Move pointer
+  --mousedown x y [button]  Press mouse button at coordinates
+  --mouseup x y [button]    Release mouse button at coordinates
+  --drag x1 y1 x2 y2        Drag from one coordinate to another
+  --scroll x y dx dy        Scroll at coordinates
+  --type <text>             Type text into the focused window
+  --key <key>               Press a key, for example Enter or ctrl+l
+  --keydown <key>           Hold a key down
+  --keyup <key>             Release a key
+  --stop                    No-op; the native desktop is managed by systemd
+  --serve                   No-op; the native desktop is managed by systemd
+  --help                    Show this help
+USAGE
+}
+
+die() {
+  printf 'cuabot: %s\n' "$*" >&2
+  exit 1
+}
+
+need_args() {
+  local want="$1"
+  local have="$2"
+  local name="$3"
+  [ "$have" -ge "$want" ] || die "${name} needs ${want} argument(s)"
+}
+
+require_display() {
+  if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+    die "native desktop is not ready on DISPLAY=${DISPLAY}"
+  fi
+}
+
+button_number() {
+  case "${1:-left}" in
+    left|1) printf '1' ;;
+    middle|2) printf '2' ;;
+    right|3) printf '3' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+screenshot() {
+  local output="${1:-/tmp/cuabot-screenshot.jpg}"
+  local tmp
+  mkdir -p "$(dirname "$output")"
+  tmp="$(mktemp --tmpdir cuabot-screenshot.XXXXXX.xwd)"
+  require_display
+  if ! xwd -display "$DISPLAY" -root -silent -out "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! xwdtopnm "$tmp" 2>/dev/null | pnmtojpeg >"$output"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+  printf 'Screenshot saved to %s\n' "$output"
+}
+
+reset_desktop() {
+  pkill -TERM -f '[n]pm exec cuabot --serve' >/dev/null 2>&1 || true
+  pkill -TERM -f '[s]h -c cuabot --serve' >/dev/null 2>&1 || true
+  pkill -TERM -f '[n]ode /usr/bin/cuabot --serve' >/dev/null 2>&1 || true
+  pkill -TERM -f '[h]eadless_shell' >/dev/null 2>&1 || true
+  pkill -TERM -f '/opt/ms-playwright/.*/[c]hrome' >/dev/null 2>&1 || true
+  pkill -TERM -x chromium >/dev/null 2>&1 || true
+  pkill -TERM -x chrome >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    if ! pgrep -u "$(id -u)" -f '[n]pm exec cuabot --serve|[s]h -c cuabot --serve|[n]ode /usr/bin/cuabot --serve|[h]eadless_shell|/opt/ms-playwright/.*/[c]hrome' >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.25
+  done
+  pkill -KILL -f '[n]pm exec cuabot --serve' >/dev/null 2>&1 || true
+  pkill -KILL -f '[s]h -c cuabot --serve' >/dev/null 2>&1 || true
+  pkill -KILL -f '[n]ode /usr/bin/cuabot --serve' >/dev/null 2>&1 || true
+  pkill -KILL -f '[h]eadless_shell' >/dev/null 2>&1 || true
+  pkill -KILL -f '/opt/ms-playwright/.*/[c]hrome' >/dev/null 2>&1 || true
+  sleep 1
+  printf 'Native desktop reset on DISPLAY=%s\n' "$DISPLAY"
+}
+
+run_xdotool() {
+  require_display
+  xdotool "$@"
+}
+
+[ "$#" -gt 0 ] || { usage; exit 0; }
+
+case "$1" in
+  --help|-h)
+    usage
+    ;;
+  --status)
+    require_display
+    printf 'Native desktop ready on DISPLAY=%s\n' "$DISPLAY"
+    ;;
+  --reset)
+    require_display
+    reset_desktop
+    ;;
+  --bash)
+    shift
+    need_args 1 "$#" "--bash"
+    require_display
+    bash -lc "$*"
+    ;;
+  --screenshot)
+    shift
+    screenshot "${1:-/tmp/cuabot-screenshot.jpg}"
+    ;;
+  --click)
+    shift
+    need_args 2 "$#" "--click"
+    x="$1"; y="$2"; button="$(button_number "${3:-left}")"
+    run_xdotool mousemove --sync "$x" "$y" click "$button"
+    ;;
+  --doubleclick)
+    shift
+    need_args 2 "$#" "--doubleclick"
+    run_xdotool mousemove --sync "$1" "$2" click --repeat 2 --delay 100 1
+    ;;
+  --move)
+    shift
+    need_args 2 "$#" "--move"
+    run_xdotool mousemove --sync "$1" "$2"
+    ;;
+  --mousedown)
+    shift
+    need_args 2 "$#" "--mousedown"
+    x="$1"; y="$2"; button="$(button_number "${3:-left}")"
+    run_xdotool mousemove --sync "$x" "$y" mousedown "$button"
+    ;;
+  --mouseup)
+    shift
+    need_args 2 "$#" "--mouseup"
+    x="$1"; y="$2"; button="$(button_number "${3:-left}")"
+    run_xdotool mousemove --sync "$x" "$y" mouseup "$button"
+    ;;
+  --drag)
+    shift
+    need_args 4 "$#" "--drag"
+    run_xdotool mousemove --sync "$1" "$2" mousedown 1 mousemove --sync "$3" "$4" mouseup 1
+    ;;
+  --scroll)
+    shift
+    need_args 4 "$#" "--scroll"
+    x="$1"; y="$2"; dy="$4"
+    [ "$dy" = "0" ] && exit 0
+    dy_abs="${dy#-}"
+    steps=$(( (dy_abs + 119) / 120 ))
+    [ "$steps" -gt 0 ] || steps=1
+    if [ "$dy" -lt 0 ]; then
+      button=4
+    else
+      button=5
+    fi
+    run_xdotool mousemove --sync "$x" "$y"
+    for _ in $(seq 1 "$steps"); do
+      run_xdotool click "$button"
+    done
+    ;;
+  --type)
+    shift
+    need_args 1 "$#" "--type"
+    run_xdotool type --clearmodifiers --delay "${CUABOT_TYPE_DELAY:-20}" -- "$*"
+    ;;
+  --key)
+    shift
+    need_args 1 "$#" "--key"
+    run_xdotool key --clearmodifiers "$@"
+    ;;
+  --keydown)
+    shift
+    need_args 1 "$#" "--keydown"
+    run_xdotool keydown "$@"
+    ;;
+  --keyup)
+    shift
+    need_args 1 "$#" "--keyup"
+    run_xdotool keyup "$@"
+    ;;
+  --stop)
+    printf 'Native desktop is managed by systemd; no nested cuabot server to stop.\n'
+    ;;
+  --serve)
+    printf 'Native desktop is managed by systemd; no nested cuabot server is started.\n'
+    ;;
+  *)
+    die "unknown command: $1"
+    ;;
+esac
+EOF
+chmod +x /usr/local/bin/cuabot
 
 log "Writing managed service environment"
 cat >/etc/youart-agent.env <<EOF
@@ -405,12 +605,21 @@ runuser -u "$SANDBOX_USER" -- bash -lc '
   done
 '
 
+log "Removing legacy nested cuabot desktop state"
+if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
+  docker ps -a --format "{{.Names}}" \
+    | awk '/^cuabot-xpra($|-)/ { print }' \
+    | xargs -r docker rm -f >/dev/null 2>&1 || true
+fi
+runuser -u "$SANDBOX_USER" -- bash -lc '
+  pkill -TERM -f "[n]pm exec cuabot --serve" >/dev/null 2>&1 || true
+  pkill -TERM -f "[s]h -c cuabot --serve" >/dev/null 2>&1 || true
+  pkill -TERM -f "[n]ode /usr/bin/cuabot --serve" >/dev/null 2>&1 || true
+  pkill -TERM -f "[h]eadless_shell" >/dev/null 2>&1 || true
+  rm -f "$HOME"/.cuabot/server*.pid "$HOME"/.cuabot/server*.port "$HOME"/.cuabot/server*.log
+' || true
+
 systemctl daemon-reload
 systemctl enable --now youart-vnc.service youart-novnc.service youart-cua-server.service
-
-log "Caching cuabot Docker image when Docker is available"
-if systemctl is-active --quiet docker; then
-  docker pull trycua/cuabot:latest || true
-fi
 
 log "Install complete"

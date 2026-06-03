@@ -40,7 +40,7 @@ Usage:
                          [--ssh-bind ADDR] [--novnc-bind ADDR] [--cua-bind ADDR]
                          [--public]
   sandbox update NAME
-  sandbox doctor NAME [--quick|--full]
+  sandbox doctor NAME
   sandbox view NAME
   sandbox ssh NAME [-- COMMAND...]
   sandbox list [NAME]
@@ -75,7 +75,7 @@ sandbox create NAME [options]
 
 Creates an Ubuntu LXD box, writes /home/USER/.ai-sandbox/box.env,
 syncs this repo into the VM, installs managed tooling, writes SSH config,
-and runs quick doctor.
+and runs doctor.
 
 Options:
   --port-base N       Use N,N+1,N+2 for SSH,noVNC,CUA. Fails if busy.
@@ -93,19 +93,17 @@ sandbox update NAME
 
 Repairs an existing box: syncs this checkout into the VM, regenerates
 managed proxy devices and SSH config from box.env, runs uninstall-managed,
-runs install, and then runs quick doctor. It preserves user browser/Codex
+runs install, and then runs doctor. It preserves user browser/Codex
 state and does not migrate the create-time user.
 EOF
       ;;
     doctor)
       cat <<'EOF'
-sandbox doctor NAME [--quick|--full]
+sandbox doctor NAME
 
-Quick is the default and checks LXD, ports, ssh NAME, noVNC, CUA /status,
-Codex login, and cuabot command surface.
-
-Full also runs direct cuabot browser smoke and a Codex-mediated browser smoke
-whose trace must show cuabot usage.
+Checks LXD, ports, ssh NAME, noVNC, CUA /status, Codex login, cuabot command
+surface, real cuabot screenshot pixels, and a Codex-mediated cuabot browser
+smoke whose trace must show the canonical cuabot path.
 EOF
       ;;
     view)
@@ -723,7 +721,7 @@ tcp_check() {
   timeout 5 bash -c "</dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1
 }
 
-doctor_quick() {
+doctor() {
   local name="$1"
   local failures=0
   local label
@@ -739,50 +737,72 @@ doctor_quick() {
       failures=$((failures + 1))
     fi
   }
+  retry_doctor() {
+    local attempt
+    for attempt in $(seq 1 30); do
+      if "$@"; then
+        return 0
+      fi
+      sleep 1
+    done
+    "$@"
+  }
 
   check_doctor "LXD instance" lxc info "$name"
-  check_doctor "SSH port ${SSH_PORT}" tcp_check "$SSH_PORT"
-  check_doctor "noVNC port ${NOVNC_PORT}" tcp_check "$NOVNC_PORT"
-  check_doctor "CUA port ${CUA_PORT}" tcp_check "$CUA_PORT"
+  check_doctor "SSH port ${SSH_PORT}" retry_doctor tcp_check "$SSH_PORT"
+  check_doctor "noVNC port ${NOVNC_PORT}" retry_doctor tcp_check "$NOVNC_PORT"
+  check_doctor "CUA port ${CUA_PORT}" retry_doctor tcp_check "$CUA_PORT"
   check_doctor "ssh ${name}" ssh -o BatchMode=yes "$name" hostname
-  check_doctor "noVNC HTTP" curl -fsS "http://127.0.0.1:${NOVNC_PORT}/"
-  check_doctor "CUA status" curl -fsS "http://127.0.0.1:${CUA_PORT}/status"
+  check_doctor "noVNC HTTP" retry_doctor curl -fsS "http://127.0.0.1:${NOVNC_PORT}/"
+  check_doctor "CUA status" retry_doctor curl -fsS "http://127.0.0.1:${CUA_PORT}/status"
   check_doctor "VM Codex login" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "codex login status 2>&1 | grep -q 'Logged in'"
   check_doctor "VM cuabot" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
     set -euo pipefail
     command -v cuabot >/dev/null
     cuabot --help | grep -q -- "--screenshot"
-    cd "$(npm root -g)/cuabot"
-    node -e "import(\"playwright\").then(async ({ chromium }) => { const browser = await chromium.launch({ headless: true }); await browser.close(); }).catch((error) => { console.error(error.message); process.exit(1); })"
   '
-
-  rm -f /tmp/ai-sandbox-doctor.out /tmp/ai-sandbox-doctor.err
-  [ "$failures" -eq 0 ] || die "${failures} quick doctor check(s) failed"
-}
-
-doctor_full() {
-  local name="$1"
-  doctor_quick "$name"
-  log "Running full cuabot browser smoke"
-  lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
+  check_doctor "VM cuabot visual pixels" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
     set -euo pipefail
     cd "$HOME"
-    url="data:text/html,%3C!doctype%20html%3E%3Ctitle%3Eai-sandbox%3C/title%3E%3Cbody%20style%3D%22font-family%3Asans-serif%3Bpadding%3A40px%22%3E%3Ch1%3EAI%20Sandbox%20Doctor%3C/h1%3E%3Cinput%20autofocus%20style%3D%22font-size%3A24px%3Bwidth%3A520px%22%3E%3C/body%3E"
-    cuabot --bash "pkill -x chromium || true; chromium --new-window \"$url\" >/tmp/ai-sandbox-cuabot-chromium.log 2>&1 &"
-    sleep 1
-    cuabot --screenshot /tmp/ai-sandbox-cuabot.jpg >/tmp/ai-sandbox-cuabot-screenshot.out
-    file /tmp/ai-sandbox-cuabot.jpg | grep -q "JPEG image data"
-    cuabot --click 160 160 >/tmp/ai-sandbox-cuabot-click.out
-    cuabot --type "ai sandbox doctor ok" >/tmp/ai-sandbox-cuabot-type.out
+    image=/tmp/ai-sandbox-cuabot.jpg
+    url="data:text/html,%3C!doctype%20html%3E%3Ctitle%3Eai-sandbox%3C/title%3E%3Cbody%20style%3D%22margin%3A0%3Bbackground%3A%23ff00ff%3Bcolor%3Awhite%3Bfont%3A48px%20sans-serif%22%3EAI%20Sandbox%20Cuabot%20Doctor%3C/body%3E"
+    cuabot --reset >/tmp/ai-sandbox-cuabot-reset.out
+    cuabot --bash "chromium --new-window \"$url\" >/tmp/ai-sandbox-cuabot-chromium.log 2>&1 &"
+    sleep 3
+    cuabot --screenshot "$image" >/tmp/ai-sandbox-cuabot-screenshot.out
+    python3 - "$image" <<'"'"'PY'"'"'
+from PIL import Image
+import sys
+
+image = Image.open(sys.argv[1]).convert("RGB")
+magenta = 0
+for r, g, b in image.getdata():
+    if r > 200 and g < 80 and b > 200:
+        magenta += 1
+
+if magenta < 10000:
+    print(f"expected magenta test page pixels, found {magenta}", file=sys.stderr)
+    sys.exit(1)
+print(f"magenta pixels: {magenta}")
+PY
   '
-  log "Running full Codex-mediated cuabot trace smoke"
-  lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
+  check_doctor "VM Codex cuabot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
     set -euo pipefail
     cd "$HOME"
     trace=/tmp/ai-sandbox-codex-cuabot-trace.jsonl
     commands_json=/tmp/ai-sandbox-codex-cuabot-commands.json
-    judge_trace=/tmp/ai-sandbox-codex-cuabot-judge.jsonl
-    prompt="Read ~/.codex/skills/cua-browser/SKILL.md if present. Use cuabot to close stale Chromium windows, open a simple data URL with heading AI Sandbox Codex Doctor, take a screenshot, and report the screenshot path. Do not edit files."
+    image=/tmp/ai-sandbox-codex-cuabot.jpg
+    html=/tmp/ai-sandbox-codex-cuabot.html
+    rm -f "$image"
+    cat >"$html" <<'"'"'HTML'"'"'
+<!doctype html>
+<title>ai-sandbox-codex</title>
+<body style="margin:0;background:#ff00ff;color:white;font:48px sans-serif">AI Sandbox Codex Cuabot Doctor</body>
+HTML
+    # codex exec may clean up background child processes between separate
+    # command executions. Keep browser launch, paint wait, and screenshot in
+    # one command execution so the browser is alive when pixels are captured.
+    prompt="Read ~/.codex/skills/cua-browser/SKILL.md if present. Then run one shell command execution that resets stale Chromium windows, opens file:///tmp/ai-sandbox-codex-cuabot.html in Chromium, waits at least 6 seconds for the page to paint, and takes a screenshot exactly at /tmp/ai-sandbox-codex-cuabot.jpg. Do not split the launch and screenshot into separate command executions. The command should be equivalent to: cuabot --reset && cuabot --bash \"chromium --new-window file:///tmp/ai-sandbox-codex-cuabot.html >/tmp/cuabot-chromium.log 2>&1 & sleep 6; cuabot --screenshot /tmp/ai-sandbox-codex-cuabot.jpg\". Do not edit files."
     timeout 600 codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$prompt" >"$trace" 2>&1
     python3 - "$trace" "$commands_json" <<'"'"'PY'"'"'
 import json
@@ -805,63 +825,45 @@ with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
 
 with open(sys.argv[2], "w", encoding="utf-8") as handle:
     json.dump(commands, handle, indent=2)
+
+joined = "\n".join(str(command.get("command", "")) for command in commands).lower()
+forbidden = ["ffmpeg", "xdotool", "gnome-screenshot", "127.0.0.1:8000", "127.0.0.1:28000"]
+if "cuabot" not in joined:
+    print("Codex trace did not execute cuabot", file=sys.stderr)
+    sys.exit(1)
+if "--screenshot" not in joined:
+    print("Codex trace did not execute cuabot --screenshot", file=sys.stderr)
+    sys.exit(1)
+for word in forbidden:
+    if word in joined:
+        print(f"Codex trace used forbidden path: {word}", file=sys.stderr)
+        sys.exit(1)
+for command in commands:
+    status = command.get("status")
+    exit_code = command.get("exit_code")
+    if status in ("failed", "error") or (exit_code is not None and exit_code != 0):
+        print(f"Codex command failed: {command}", file=sys.stderr)
+        sys.exit(1)
 PY
-    commands="$(cat "$commands_json")"
-    judge_prompt="$(cat <<EOF
-You are judging whether an AI Sandbox browser-automation smoke test succeeded.
-
-The test asked a Codex agent to use the canonical cuabot browser path. Judge ONLY the executed command list below. Ignore forbidden words if they only appeared in documentation, prompts, command output, or agent narration.
-
-Return exactly one line:
-true
-or
-false
-
-Return true only if:
-- The executed commands show the agent used cuabot for browser automation.
-- The executed commands include a cuabot screenshot command, such as "cuabot --screenshot ...".
-- The executed commands do not use forbidden automation paths.
-
-Forbidden automation paths:
-- ffmpeg
-- xdotool
-- gnome-screenshot
-- noVNC as an automation API
-- raw CUA HTTP/API calls or CUA URLs/ports, including 127.0.0.1:8000 or 127.0.0.1:28000
-
-Executed commands JSON:
-$commands
-EOF
-)"
-    timeout 600 codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$judge_prompt" >"$judge_trace" 2>&1
-    python3 - "$judge_trace" <<'"'"'PY'"'"'
-import json
-import re
+    python3 - "$image" <<'"'"'PY'"'"'
+from PIL import Image
 import sys
 
-last_message = ""
-with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
-    for line in handle:
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        item = obj.get("item")
-        if isinstance(item, dict) and item.get("type") == "agent_message":
-            last_message = item.get("text", "")
+image = Image.open(sys.argv[1]).convert("RGB")
+magenta = 0
+for r, g, b in image.getdata():
+    if r > 200 and g < 80 and b > 200:
+        magenta += 1
 
-verdict = last_message.strip().lower()
-verdict = re.sub(r"^```[A-Za-z0-9_-]*\n|\n```$", "", verdict).strip()
-first_line = verdict.splitlines()[0].strip() if verdict else ""
-if first_line == "true":
-    print("[doctor] Codex trace judge             ok")
-    sys.exit(0)
-if not first_line:
-    first_line = "no verdict"
-print(f"[doctor][stderr] Codex trace judge returned {first_line!r}", file=sys.stderr)
-sys.exit(1)
+if magenta < 10000:
+    print(f"expected magenta Codex screenshot pixels, found {magenta}", file=sys.stderr)
+    sys.exit(1)
+print(f"Codex screenshot magenta pixels: {magenta}")
 PY
   '
+
+  rm -f /tmp/ai-sandbox-doctor.out /tmp/ai-sandbox-doctor.err
+  [ "$failures" -eq 0 ] || die "${failures} doctor check(s) failed"
 }
 
 cmd_create() {
@@ -914,7 +916,7 @@ cmd_create() {
   sync_host_codex_profile "$name" "$user"
   run_install "$name" "$user" no
   write_ssh_config "$name" "$user" "$SSH_PORT"
-  cmd_doctor "$name" --quick
+  cmd_doctor "$name"
   log "Created ${name}"
   printf 'SSH:   ssh %s\n' "$name"
   printf 'noVNC: http://127.0.0.1:%s/\n' "$NOVNC_PORT"
@@ -938,7 +940,7 @@ cmd_update() {
   ensure_box_ssh_key "$name" "$SANDBOX_USER"
   run_install "$name" "$SANDBOX_USER" yes
   write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
-  cmd_doctor "$name" --quick
+  cmd_doctor "$name"
   log "Updated ${name}"
 }
 
@@ -946,11 +948,8 @@ cmd_doctor() {
   require_cmd lxc
   require_cmd curl
   local name=""
-  local mode="quick"
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --quick) mode="quick"; shift ;;
-      --full) mode="full"; shift ;;
       -h|--help) command_help doctor; exit 0 ;;
       --*) die "Unknown doctor option: $1" ;;
       *) [ -z "$name" ] || die "Unexpected argument: $1"; name="$1"; shift ;;
@@ -961,11 +960,7 @@ cmd_doctor() {
   instance_exists "$name" || die "LXD instance not found: ${name}"
   load_box_env "$name" || die "No box.env found; run update first"
   write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
-  if [ "$mode" = "full" ]; then
-    doctor_full "$name"
-  else
-    doctor_quick "$name"
-  fi
+  doctor "$name"
 }
 
 cmd_view() {

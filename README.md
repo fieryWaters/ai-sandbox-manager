@@ -9,7 +9,7 @@ Use the root CLI:
 ```bash
 sandbox create NAME [--port-base N] [--user USER]
 sandbox update NAME
-sandbox doctor NAME [--quick|--full]
+sandbox doctor NAME
 sandbox view NAME
 sandbox ssh NAME [-- command...]
 sandbox list [NAME]
@@ -22,11 +22,11 @@ The important invariants:
 - Spark must be able to run `ssh NAME`.
 - `sandbox view NAME` prints the noVNC URL for the box.
 - `sandbox update NAME` repairs the VM tooling from this repo.
-- Agents use `cuabot` for browser automation.
-- noVNC is for human supervision only.
+- Agents use `cuabot` for browser automation on the VM's native desktop.
+- noVNC is for human supervision of that same desktop.
 - CUA HTTP is installed only as fallback/debug.
 
-Before browser work, agents should close stale Chromium windows/tabs. They should not delete the persistent Chromium profile because OAuth login state is intentional.
+Before browser work, agents should run `cuabot --reset` to close stale Chromium windows/tabs. They should not delete the persistent Chromium profile because OAuth login state is intentional.
 
 ## Create
 
@@ -187,7 +187,7 @@ It starts the VM if needed, reads `box.env`, regenerates LXD proxy devices and S
 ./install.sh
 ```
 
-Then it runs quick doctor.
+Then it runs doctor.
 
 If the recorded port block is no longer available after old managed proxy devices are removed, update warns and moves the box to the next free contiguous block. The final `box.env` and SSH config are rewritten to match.
 
@@ -207,24 +207,29 @@ Do not disable Ubuntu's automatic security update path in managed boxes. These V
 
 `install.sh` handles the known apt lock race by retrying apt commands when Ubuntu's background update job briefly owns `/var/lib/apt/lists/lock`. Future changes should keep that retry behavior instead of deleting lock files or turning off automatic security updates.
 
-## Doctor
+## Browser Topology
 
-Quick doctor is the default:
+There is one managed desktop in the VM: the native VNC desktop on `DISPLAY=:1`.
+
+`sandbox view NAME` exposes that desktop through noVNC for humans. The managed
+`cuabot` command controls that same desktop for agents. This keeps what the
+human sees and what the agent screenshots/clicks in sync.
+
+The installer removes legacy nested `cuabot-xpra` desktop state if it exists.
+That path created a second hidden desktop, which made noVNC supervision and
+agent screenshots disagree.
+
+## Doctor
 
 ```bash
 sandbox doctor NAME
-sandbox doctor NAME --quick
 ```
 
-It checks LXD, the three host ports, `ssh NAME`, noVNC HTTP, CUA `/status`, Codex login, and the cuabot command/browser dependency surface.
-
-Full doctor adds real browser automation:
-
-```bash
-sandbox doctor NAME --full
-```
-
-It runs a direct `cuabot` browser smoke and a Codex-mediated browser smoke. A second Codex pass judges the executed-command trace and must return exactly `true` or `false`; it returns `true` only when the browser work used `cuabot`, including `cuabot --screenshot`, without using ffmpeg, noVNC, xdotool, gnome-screenshot, or raw CUA.
+Doctor checks LXD, the three host ports, `ssh NAME`, noVNC HTTP, CUA `/status`,
+Codex login, the cuabot command surface, real screenshot pixels from the native
+desktop, and a Codex-mediated browser smoke. The Codex smoke must use `cuabot`,
+including `cuabot --screenshot`, and the resulting screenshot must contain the
+expected test pixels.
 
 ## View
 
@@ -275,11 +280,9 @@ lxc exec sandbox-smoke -- runuser -u agent -- bash -lc \
   'cd ~/.ai-sandbox/ai-sandbox-manager && test -f sandbox && test -f install.sh && test -f uninstall-managed.sh && ./sandbox help >/dev/null'
 ```
 
-Run full doctor when browser automation behavior changes:
-
-```bash
-sandbox doctor sandbox-smoke --full
-```
+When browser automation behavior changes, `sandbox doctor sandbox-smoke` is the
+required browser verification. It includes both direct cuabot pixel validation
+and a Codex-mediated cuabot smoke.
 
 To test the apt lock retry deterministically, hold the real apt lists lock in
 the VM and run update from another shell:
@@ -295,7 +298,7 @@ sandbox update sandbox-smoke
 ```
 
 The pass condition is that install output shows `apt is busy; waiting`, then
-continues after the lock releases and quick doctor passes. Do not test this by
+continues after the lock releases and doctor passes. Do not test this by
 deleting apt lock files or disabling Ubuntu's automatic security update jobs.
 
 Destroy only throwaway boxes, and verify exact-name confirmation:

@@ -5,14 +5,15 @@ description: Use this when browser GUI automation is needed. The canonical path 
 
 # Cua Browser Automation
 
-Use `cuabot` first.
+Use `cuabot` for browser automation.
 
-Before a new browser task, close stale Chromium windows/tabs in the cuabot sandbox. This keeps screenshots and coordinates predictable while preserving the persistent Chromium profile used for OAuth/login state.
+Before a new browser task, reset stale Chromium windows/tabs. This preserves the persistent Chromium profile used for OAuth/login state.
 
-Do not use noVNC, ffmpeg, xdotool, gnome-screenshot, or the raw CUA HTTP API for normal browser automation. Screenshots, clicks, typing, scrolling, and browser launch should go through `cuabot`.
+In a managed AI Sandbox VM, `cuabot` controls the native desktop on `DISPLAY=:1`. `sandbox view NAME` shows that same desktop through noVNC for human supervision. The CUA HTTP API is installed only as fallback/debug.
 
 ```bash
-cuabot --bash 'pkill -x chromium || true; chromium --new-window https://example.com >/tmp/cuabot-chromium.log 2>&1 &'
+cuabot --reset
+cuabot --bash 'chromium --new-window https://example.com >/tmp/cuabot-chromium.log 2>&1 &'
 cuabot --screenshot /tmp/cua-browser.jpg
 cuabot --click 100 200
 cuabot --type 'hello'
@@ -20,7 +21,7 @@ cuabot --key Enter
 cuabot --scroll 600 500 0 -500
 ```
 
-For a local dev server running on the parent host, open it from cuabot Chromium with `http://host.docker.internal:<port>`.
+For a local dev server running on the parent host, open the URL that is reachable from the VM desktop. `host.docker.internal` is useful when it resolves; otherwise use the host bridge, LAN, or Tailscale address shown by the dev server or `sandbox list NAME`.
 
 ## AI Sandbox VM
 
@@ -48,11 +49,7 @@ Then verify:
 sandbox doctor NAME
 ```
 
-Use full doctor when you need to prove Codex itself follows the browser contract:
-
-```bash
-sandbox doctor NAME --full
-```
+`doctor` includes direct pixel validation and a Codex-mediated cuabot browser smoke.
 
 ## Fallback
 
