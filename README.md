@@ -156,6 +156,12 @@ Update preserves:
 - `box.env`
 - logs
 
+## Package Security
+
+Do not disable Ubuntu's automatic security update path in managed boxes. These VMs may be exposed beyond localhost, so `apt-daily.timer`, `apt-daily-upgrade.timer`, and `unattended-upgrades` should remain available.
+
+`install.sh` handles the known apt lock race by retrying apt commands when Ubuntu's background update job briefly owns `/var/lib/apt/lists/lock`. Future changes should keep that retry behavior instead of deleting lock files or turning off automatic security updates.
+
 ## Doctor
 
 Quick doctor is the default:

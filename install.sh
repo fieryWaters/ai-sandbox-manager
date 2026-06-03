@@ -8,6 +8,49 @@ log() { printf '[ai-sandbox-install] %s\n' "$*"; }
 
 [ "$(id -u)" -eq 0 ] || die "Run install.sh as root"
 
+apt_get() {
+  local attempt=1
+  local max_attempts=60
+  local delay=5
+  local output
+  local status
+
+  # Keep Ubuntu's automatic security update path enabled. These boxes may be
+  # exposed beyond localhost, so do not "fix" apt lock races by disabling
+  # apt-daily, apt-daily-upgrade, or unattended-upgrades.
+  #
+  # Ubuntu's apt-daily.service can wake up during VM provisioning and briefly
+  # hold /var/lib/apt/lists/lock between our apt phases. This is the same class
+  # of race as Ubuntu/cloud-init bug 1693361. DPkg::Lock::Timeout helps install
+  # waits, but apt-get update can still fail immediately on the lists lock, so
+  # retry known lock errors instead of deleting locks or disabling security jobs.
+  while true; do
+    output="$(mktemp)"
+    log "Running apt-get $*"
+    set +e
+    apt-get -o DPkg::Lock::Timeout=600 "$@" 2>&1 | tee "$output"
+    status="${PIPESTATUS[0]}"
+    set -e
+
+    if [ "$status" -eq 0 ]; then
+      rm -f "$output"
+      return 0
+    fi
+
+    if grep -Eq 'Could not get lock|Unable to lock|Unable to acquire.*lock|Could not open lock' "$output" &&
+      [ "$attempt" -lt "$max_attempts" ]; then
+      rm -f "$output"
+      log "apt is busy; waiting ${delay}s before retrying ($attempt/$max_attempts)"
+      sleep "$delay"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    rm -f "$output"
+    return "$status"
+  done
+}
+
 validate_user() {
   [[ "$1" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "Invalid SANDBOX_USER in box.env: $1"
 }
@@ -85,8 +128,8 @@ fi
 printf 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main\n' \
   >/etc/apt/sources.list.d/nodesource.list
 
-apt-get update
-apt-get install -y \
+apt_get update
+apt_get install -y \
   ca-certificates curl wget git gnupg gpg lsb-release software-properties-common \
   sudo jq unzip zip net-tools netcat-openbsd xdg-utils dbus-x11 x11-utils xterm \
   openssh-server \
@@ -109,8 +152,8 @@ if curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
   curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
     | sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" \
     >/etc/apt/sources.list.d/nvidia-container-toolkit.list
-  apt-get update
-  apt-get install -y nvidia-container-toolkit || true
+  apt_get update
+  apt_get install -y nvidia-container-toolkit || true
   if command -v nvidia-ctk >/dev/null 2>&1; then
     nvidia-ctk runtime configure --runtime=docker || true
     [ ! -f /etc/nvidia-container-runtime/config.toml ] || \
