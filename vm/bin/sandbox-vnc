@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Env (VNC_PW, ports) comes from the unit's EnvironmentFile=/etc/ai-sandbox.env,
+# loaded by systemd as root; the file itself is 600 and unreadable to this user.
+rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
+mkdir -p "$HOME/.vnc"
+echo "$VNC_PW" | vncpasswd -f > "$HOME/.vnc/passwd"
+chmod 600 "$HOME/.vnc/passwd"
+# -localhost yes: only the LXD proxy (which connects from inside this netns)
+# and in-box services need VNC; never expose 5901 on the LXD bridge.
+vncserver :1 \
+  -geometry "${VNC_RESOLUTION:-1280x800}" \
+  -depth "${VNC_COL_DEPTH:-24}" \
+  -rfbport "${VNC_PORT:-5901}" \
+  -localhost yes \
+  -SecurityTypes VncAuth \
+  -rfbauth "$HOME/.vnc/passwd" \
+  -AlwaysShared \
+  -AcceptPointerEvents \
+  -AcceptKeyEvents \
+  -AcceptCutText \
+  -SendCutText \
+  -xstartup /usr/local/bin/sandbox-xstartup
+tail -F "$HOME"/.vnc/*.log

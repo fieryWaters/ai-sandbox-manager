@@ -7,14 +7,23 @@ die() { printf '[ai-sandbox-uninstall][error] %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "Run uninstall-managed.sh as root"
 
 log "Stopping managed services"
-systemctl disable --now youart-cua-server.service youart-novnc.service youart-vnc.service >/dev/null 2>&1 || true
-systemctl stop youart-cua-server.service youart-novnc.service youart-vnc.service >/dev/null 2>&1 || true
+systemctl disable --now \
+  sandbox-cua-server.service sandbox-novnc.service sandbox-vnc.service \
+  youart-cua-server.service youart-novnc.service youart-vnc.service \
+  >/dev/null 2>&1 || true
 
 log "Removing managed service units and scripts"
 rm -f \
+  /etc/systemd/system/sandbox-cua-server.service \
+  /etc/systemd/system/sandbox-novnc.service \
+  /etc/systemd/system/sandbox-vnc.service \
   /etc/systemd/system/youart-cua-server.service \
   /etc/systemd/system/youart-novnc.service \
   /etc/systemd/system/youart-vnc.service \
+  /usr/local/bin/sandbox-cua-server \
+  /usr/local/bin/sandbox-novnc \
+  /usr/local/bin/sandbox-vnc \
+  /usr/local/bin/sandbox-xstartup \
   /usr/local/bin/youart-start-cua-server \
   /usr/local/bin/youart-start-novnc \
   /usr/local/bin/youart-start-vnc \
@@ -22,11 +31,11 @@ rm -f \
 
 systemctl daemon-reload
 
-log "Removing managed noVNC and CUA fallback installs"
+log "Removing managed noVNC and computer-server installs"
 rm -rf /opt/noVNC /opt/cua-computer-server
 
-log "Removing managed browser/cuabot wrappers"
-rm -f /usr/local/bin/chromium /usr/local/bin/cuabot
+log "Removing managed browser/desktop wrappers"
+rm -f /usr/local/bin/chromium /usr/local/bin/deskbot /usr/local/bin/cuabot
 
 log "Removing legacy nested cuabot desktop state"
 for home in /home/*; do
@@ -52,10 +61,10 @@ for home in /home/*; do
 done
 
 log "Removing managed sudoers/env files"
-rm -f /etc/sudoers.d/90-ai-sandbox /etc/youart-agent.env
+rm -f /etc/sudoers.d/90-ai-sandbox /etc/ai-sandbox.env /etc/youart-agent.env
 
 log "Preserving user state"
 printf '%s\n' \
-  'preserved: Chromium profiles, Codex auth/config, SSH keys, git-repos, workspace, box.env, logs'
+  'preserved: Chromium profiles, Codex auth/config, Claude auth/config, SSH keys, git-repos, workspace, box.env, logs'
 
 log "Uninstall-managed complete"

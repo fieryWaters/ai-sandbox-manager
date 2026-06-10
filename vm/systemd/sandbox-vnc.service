@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Sandbox XFCE VNC Desktop
+After=network-online.target
+
+[Service]
+User=@AGENT_USER@
+EnvironmentFile=/etc/ai-sandbox.env
+WorkingDirectory=@AGENT_HOME@
+ExecStart=/usr/local/bin/sandbox-vnc
+ExecStop=-/usr/bin/vncserver -kill :1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

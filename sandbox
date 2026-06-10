@@ -31,7 +31,6 @@ BOX_STATE_DIR="${STATE_DIR}/boxes"
 SSH_DIR="${STATE_DIR}/ssh"
 SSH_MANAGED_CONFIG="${SSH_DIR}/config"
 SSH_CONFIG="${HOME}/.ssh/config"
-LEGACY_SSH_KEY_DIR="${HOME}/.ssh/ai-sandbox"
 SSH_KEY_DIR="$SSH_DIR"
 SSH_KNOWN_HOSTS="${SSH_DIR}/known_hosts"
 
@@ -77,8 +76,10 @@ Host-side state:
   ~/.ai-sandbox/ssh       SSH keys, known-hosts, and managed SSH config.
   ~/.ai-sandbox/archives  Default export/import location.
 
-Browser automation contract:
-  Agents use cuabot. noVNC is for humans. CUA HTTP is fallback/debug.
+Desktop automation contract:
+  Agents use deskbot from the shell, or cua computer-server (port 8000)
+  programmatically. Both drive the box's one native desktop. noVNC shows
+  that same desktop to humans.
 EOF
 }
 
@@ -167,9 +168,10 @@ EOF
       cat <<'EOF'
 sandbox doctor NAME
 
-Checks LXD, ports, ssh NAME, noVNC, CUA /status, Codex login, cuabot command
-surface, real cuabot screenshot pixels, and a Codex-mediated cuabot browser
-smoke whose trace must show the canonical cuabot path.
+Checks LXD, ports, ssh NAME, noVNC, computer-server /status, Codex login,
+Claude auth, the deskbot command surface, real deskbot screenshot pixels, a
+Codex-mediated deskbot browser smoke whose trace must show the canonical
+deskbot path, and a Claude-mediated deskbot browser smoke.
 EOF
       ;;
     view)
@@ -243,28 +245,6 @@ remove_managed_ssh_block_from_file() {
   rm -f "$tmp"
 }
 
-managed_ssh_block_names() {
-  local file="$1"
-  [ -f "$file" ] || return
-  awk '
-    /^# >>> ai-sandbox / {
-      sub(/^# >>> ai-sandbox /, "")
-      print
-    }
-  ' "$file"
-}
-
-managed_ssh_block() {
-  local file="$1"
-  local name="$2"
-  [ -f "$file" ] || return
-  awk -v name="$name" '
-    $0 == "# >>> ai-sandbox " name { print; keep=1; next }
-    keep { print }
-    $0 == "# <<< ai-sandbox " name { keep=0 }
-  ' "$file"
-}
-
 ensure_ssh_include() {
   ensure_state_dirs
   mkdir -p "$(dirname "$SSH_CONFIG")"
@@ -286,41 +266,6 @@ ensure_ssh_include() {
     cat "$tmp" >"$SSH_CONFIG"
     rm -f "$tmp"
   fi
-}
-
-migrate_legacy_ssh_state() {
-  ensure_state_dirs
-  if [ -d "$LEGACY_SSH_KEY_DIR" ]; then
-    local path dest
-    for path in "$LEGACY_SSH_KEY_DIR"/*; do
-      [ -e "$path" ] || continue
-      dest="${SSH_DIR}/$(basename "$path")"
-      if [ ! -e "$dest" ]; then
-        mv "$path" "$dest"
-      else
-        warn "Leaving legacy SSH file in place because ${dest} already exists: ${path}"
-      fi
-    done
-    rmdir "$LEGACY_SSH_KEY_DIR" 2>/dev/null || true
-  fi
-
-  [ -f "$SSH_CONFIG" ] || return 0
-  local names=()
-  local name block
-  while IFS= read -r name; do
-    [ -n "$name" ] && names+=("$name")
-  done < <(managed_ssh_block_names "$SSH_CONFIG")
-  [ "${#names[@]}" -gt 0 ] || return 0
-
-  ensure_ssh_include
-  for name in "${names[@]}"; do
-    block="$(managed_ssh_block "$SSH_CONFIG" "$name" |
-      sed -e "s#${HOME}/.ssh/ai-sandbox#${SSH_DIR}#g" \
-          -e "s#~/.ssh/ai-sandbox#${SSH_DIR}#g")"
-    remove_managed_ssh_block_from_file "$SSH_MANAGED_CONFIG" "$name"
-    printf '%s\n' "$block" >>"$SSH_MANAGED_CONFIG"
-    remove_managed_ssh_block_from_file "$SSH_CONFIG" "$name"
-  done
 }
 
 validate_name() {
@@ -368,7 +313,7 @@ configured_proxy_port_owner() {
   while IFS=, read -r name _status; do
     [ -n "$name" ] || continue
     [ "$name" = "$exclude" ] && continue
-    for device in ai-sandbox-ssh ai-sandbox-novnc ai-sandbox-cua host-ssh host-novnc host-cua; do
+    for device in ai-sandbox-ssh ai-sandbox-novnc ai-sandbox-cua; do
       listen="$(device_listen "$name" "$device")"
       [ -n "$listen" ] || continue
       listen_port="$(parse_listen_port "$listen")"
@@ -435,7 +380,7 @@ generate_password() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -hex 18 | tr -d '\n'
   else
-    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
+    od -An -N18 -tx1 /dev/urandom | tr -d ' \n'
   fi
 }
 
@@ -494,8 +439,19 @@ repo_dir_for_user() {
 
 read_box_env() {
   local name="$1"
-  if [ "$(instance_status "$name")" != "STOPPED" ] &&
-    lxc exec "$name" -- bash -lc '
+  # The host mirror is authoritative. The copy inside the box is written by
+  # the host for the installer's benefit and is never read back once a mirror
+  # exists — an agent with sudo in the box must not be able to change its own
+  # exposure. The in-box fallback only adopts boxes that predate mirrors
+  # (e.g. imported archives), and those values are validated by load_box_env.
+  local host_env
+  host_env="$(host_box_env_path "$name")"
+  if [ -f "$host_env" ]; then
+    cat "$host_env"
+    return 0
+  fi
+  [ "$(instance_status "$name")" != "STOPPED" ] || return 1
+  lxc exec "$name" -- bash -lc '
     for path in /home/*/.ai-sandbox/box.env; do
       if [ -f "$path" ]; then
         cat "$path"
@@ -503,13 +459,7 @@ read_box_env() {
       fi
     done
     exit 1
-  ' </dev/null 2>/dev/null; then
-    return 0
-  fi
-  local host_env
-  host_env="$(host_box_env_path "$name")"
-  [ -f "$host_env" ] || return 1
-  cat "$host_env"
+  ' </dev/null 2>/dev/null
 }
 
 load_box_env() {
@@ -548,7 +498,7 @@ load_box_env() {
   SSH_BIND="${SSH_BIND:-$DEFAULT_BIND}"
   NOVNC_BIND="${NOVNC_BIND:-$DEFAULT_BIND}"
   CUA_BIND="${CUA_BIND:-$DEFAULT_BIND}"
-  VNC_PASSWORD="${VNC_PASSWORD:-youart-agent}"
+  [ -n "$VNC_PASSWORD" ] || return 1
   [ -n "$PORT_BASE" ] || return 1
   validate_user "$SANDBOX_USER"
   validate_port_base "$PORT_BASE"
@@ -624,52 +574,17 @@ service_hosts_for_bind() {
 
 effective_proxy() {
   local name="$1"
-  local primary_device="$2"
-  local legacy_device="$3"
-  local fallback_bind="$4"
-  local fallback_port="$5"
+  local device="$2"
+  local fallback_bind="$3"
+  local fallback_port="$4"
   EFFECTIVE_BIND="$fallback_bind"
   EFFECTIVE_PORT="$fallback_port"
   local listen
-  listen="$(device_listen "$name" "$primary_device")"
-  [ -n "$listen" ] || listen="$(device_listen "$name" "$legacy_device")"
+  listen="$(device_listen "$name" "$device")"
   if [ -n "$listen" ]; then
     EFFECTIVE_BIND="$(parse_listen_bind "$listen")"
     EFFECTIVE_PORT="$(parse_listen_port "$listen")"
   fi
-}
-
-legacy_or_new_box_env() {
-  local name="$1"
-  if load_box_env "$name"; then
-    return
-  fi
-
-  warn "No box.env found in ${name}; creating one from legacy/default state"
-  SANDBOX_USER="$DEFAULT_USER"
-  VNC_PASSWORD="youart-agent"
-  if lxc exec "$name" -- test -f /etc/youart-agent.env >/dev/null 2>&1; then
-    local legacy
-    legacy="$(lxc exec "$name" -- bash -lc 'source /etc/youart-agent.env; printf "%s\n%s\n" "${AGENT_USER:-agent}" "${VNC_PW:-youart-agent}"')"
-    SANDBOX_USER="$(printf '%s\n' "$legacy" | sed -n '1p')"
-    VNC_PASSWORD="$(printf '%s\n' "$legacy" | sed -n '2p')"
-  fi
-  validate_user "$SANDBOX_USER"
-
-  local listen
-  listen="$(device_listen "$name" ai-sandbox-ssh)"
-  [ -n "$listen" ] || listen="$(device_listen "$name" host-ssh)"
-  if [ -n "$listen" ]; then
-    PORT_BASE="$(parse_listen_port "$listen")"
-    SSH_BIND="$(normalize_bind "$(parse_listen_bind "$listen")")"
-  else
-    PORT_BASE="$(find_free_port_base "$DEFAULT_PORT_BASE")"
-    SSH_BIND="$DEFAULT_BIND"
-  fi
-  NOVNC_BIND="$DEFAULT_BIND"
-  CUA_BIND="$DEFAULT_BIND"
-  validate_port_base "$PORT_BASE"
-  ports_from_base "$PORT_BASE"
 }
 
 ensure_user() {
@@ -807,17 +722,19 @@ refresh_vm_vnc_password() {
   local vnc_password="$3"
   lxc exec "$name" -- bash -lc "
     set -e
-    if [ -f /etc/youart-agent.env ]; then
+    for env_file in /etc/ai-sandbox.env /etc/youart-agent.env; do
+      [ -f \"\$env_file\" ] || continue
       sed -i \
         -e 's/^VNC_PW=.*/VNC_PW=${vnc_password}/' \
         -e 's/^CUA_VNC_PASSWORD=.*/CUA_VNC_PASSWORD=${vnc_password}/' \
-        /etc/youart-agent.env
-    fi
+        \"\$env_file\"
+    done
     install -d -m 700 -o '$user' -g '$user' '/home/$user/.vnc'
     printf '%s\n' '${vnc_password}' | runuser -u '$user' -- vncpasswd -f > '/home/$user/.vnc/passwd'
     chown '$user:$user' '/home/$user/.vnc/passwd'
     chmod 600 '/home/$user/.vnc/passwd'
-    systemctl restart youart-vnc.service youart-novnc.service youart-cua-server.service 2>/dev/null || true
+    systemctl restart sandbox-vnc.service sandbox-novnc.service sandbox-cua-server.service 2>/dev/null ||
+      systemctl restart youart-vnc.service youart-novnc.service youart-cua-server.service 2>/dev/null || true
   "
 }
 
@@ -865,7 +782,6 @@ ensure_box_ssh_key() {
   local name="$1"
   local user="$2"
   require_cmd ssh-keygen
-  migrate_legacy_ssh_state
   ensure_state_dirs
   local key_path="${SSH_KEY_DIR}/${name}_ed25519"
   if [ ! -f "$key_path" ]; then
@@ -904,7 +820,7 @@ sync_host_codex_profile() {
   [ -d "$source" ] || return
   local items=()
   local rel
-  for rel in auth.json config.toml AGENTS.md AGENTS.override.md hooks.json rules memories; do
+  for rel in auth.json config.toml AGENTS.md AGENTS.override.md hooks.json hooks rules memories; do
     [ -e "$source/$rel" ] && items+=("$rel")
   done
   [ "${#items[@]}" -gt 0 ] || return
@@ -917,6 +833,41 @@ sync_host_codex_profile() {
     chmod 700 '/home/$user/.codex'
     [ ! -f '/home/$user/.codex/auth.json' ] || chmod 600 '/home/$user/.codex/auth.json'
     [ ! -f '/home/$user/.codex/config.toml' ] || chmod 600 '/home/$user/.codex/config.toml'
+    find '/home/$user/.codex/hooks' -type f -exec chmod 755 {} + 2>/dev/null || true
+  "
+}
+
+sync_host_claude_profile() {
+  local name="$1"
+  local user="$2"
+  local source="${HOME}/.claude"
+  [ -d "$source" ] || return 0
+  local items=()
+  local rel
+  for rel in .credentials.json settings.json CLAUDE.md agents skills; do
+    [ -e "$source/$rel" ] && items+=("$rel")
+  done
+  if [ "${#items[@]}" -gt 0 ]; then
+    log "Importing host Claude profile files for ${user}"
+    lxc exec "$name" -- bash -lc "install -d -m 700 -o '$user' -g '$user' '/home/$user/.claude'"
+    tar -C "$source" -cf - "${items[@]}" \
+      | lxc exec "$name" -- tar -C "/home/$user/.claude" -xf -
+  fi
+
+  # ~/.claude.json carries onboarding/account state. Build a minimal one so
+  # Claude in the box is signed in and non-interactive, without inheriting
+  # host project history.
+  if [ -f "${HOME}/.claude.json" ] && command -v jq >/dev/null 2>&1; then
+    jq '{hasCompletedOnboarding: true, bypassPermissionsModeAccepted: true}
+        + (if .oauthAccount then {oauthAccount: .oauthAccount} else {} end)' \
+      "${HOME}/.claude.json" \
+      | lxc exec "$name" -- bash -lc "cat > '/home/$user/.claude.json'"
+  fi
+  lxc exec "$name" -- bash -lc "
+    chown -R '$user:$user' '/home/$user/.claude'
+    chmod 700 '/home/$user/.claude'
+    [ ! -f '/home/$user/.claude/.credentials.json' ] || chmod 600 '/home/$user/.claude/.credentials.json'
+    [ ! -f '/home/$user/.claude.json' ] || chown '$user:$user' '/home/$user/.claude.json'
   "
 }
 
@@ -972,7 +923,6 @@ write_ssh_config() {
   local key_path="${SSH_KEY_DIR}/${name}_ed25519"
   local host_alias
   host_alias="$(managed_host_alias "$name")"
-  migrate_legacy_ssh_state
   ensure_ssh_include
   touch "$SSH_KNOWN_HOSTS"
   chmod 600 "$SSH_KNOWN_HOSTS"
@@ -1040,121 +990,58 @@ doctor() {
   check_doctor "VM hostname" ssh_hostname_matches "$name"
   check_doctor "noVNC HTTP" retry_doctor curl -fsS "http://127.0.0.1:${NOVNC_PORT}/"
   check_doctor "CUA status" retry_doctor curl -fsS "http://127.0.0.1:${CUA_PORT}/status"
+  # Doctor's validation scripts run from the checkout that sync_repo_to_vm
+  # already placed inside the box, so the code that runs is the code in vm/.
+  local vm_doctor
+  vm_doctor="$(repo_dir_for_user "$SANDBOX_USER")/vm/doctor"
+
   check_doctor "VM Codex login" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "codex login status 2>&1 | grep -q 'Logged in'"
-  check_doctor "VM cuabot" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
+  check_doctor "VM Claude auth" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
     set -euo pipefail
-    command -v cuabot >/dev/null
-    cuabot --help | grep -q -- "--screenshot"
+    test -s "$HOME/.claude/.credentials.json"
+    timeout 120 claude -p "Reply with exactly: ok" | grep -qi "ok"
   '
-  check_doctor "VM cuabot visual pixels" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
+  check_doctor "VM deskbot" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
     set -euo pipefail
-    cd "$HOME"
-    image=/tmp/ai-sandbox-cuabot.jpg
-    url="data:text/html,%3C!doctype%20html%3E%3Ctitle%3Eai-sandbox%3C/title%3E%3Cbody%20style%3D%22margin%3A0%3Bbackground%3A%23ff00ff%3Bcolor%3Awhite%3Bfont%3A48px%20sans-serif%22%3EAI%20Sandbox%20Cuabot%20Doctor%3C/body%3E"
-    cuabot --reset >/tmp/ai-sandbox-cuabot-reset.out
-    cuabot --bash "chromium --new-window \"$url\" >/tmp/ai-sandbox-cuabot-chromium.log 2>&1 &"
+    command -v deskbot >/dev/null
+    deskbot --help | grep -q -- "--screenshot"
+  '
+  check_doctor "VM deskbot visual pixels" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
+    set -euo pipefail
+    cd \"\$HOME\"
+    image=/tmp/ai-sandbox-deskbot.jpg
+    url='data:text/html,%3C!doctype%20html%3E%3Ctitle%3Eai-sandbox%3C/title%3E%3Cbody%20style%3D%22margin%3A0%3Bbackground%3A%23ff00ff%3Bcolor%3Awhite%3Bfont%3A48px%20sans-serif%22%3EAI%20Sandbox%20Deskbot%20Doctor%3C/body%3E'
+    deskbot --reset >/tmp/ai-sandbox-deskbot-reset.out
+    deskbot --bash \"chromium --new-window '\$url' >/tmp/ai-sandbox-deskbot-chromium.log 2>&1 &\"
     sleep 3
-    cuabot --screenshot "$image" >/tmp/ai-sandbox-cuabot-screenshot.out
-    python3 - "$image" <<'"'"'PY'"'"'
-from PIL import Image
-import sys
-
-image = Image.open(sys.argv[1]).convert("RGB")
-magenta = 0
-for r, g, b in image.getdata():
-    if r > 200 and g < 80 and b > 200:
-        magenta += 1
-
-if magenta < 10000:
-    print(f"expected magenta test page pixels, found {magenta}", file=sys.stderr)
-    sys.exit(1)
-print(f"magenta pixels: {magenta}")
-PY
-  '
-  check_doctor "VM Codex cuabot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
+    deskbot --screenshot \"\$image\" >/tmp/ai-sandbox-deskbot-screenshot.out
+    python3 '${vm_doctor}/check_pixels.py' \"\$image\"
+  "
+  check_doctor "VM Codex deskbot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
     set -euo pipefail
-    cd "$HOME"
-    trace=/tmp/ai-sandbox-codex-cuabot-trace.jsonl
-    commands_json=/tmp/ai-sandbox-codex-cuabot-commands.json
-    image=/tmp/ai-sandbox-codex-cuabot.jpg
-    html=/tmp/ai-sandbox-codex-cuabot.html
-    rm -f "$image"
-    cat >"$html" <<'"'"'HTML'"'"'
-<!doctype html>
-<title>ai-sandbox-codex</title>
-<body style="margin:0;background:#ff00ff;color:white;font:48px sans-serif">AI Sandbox Codex Cuabot Doctor</body>
-HTML
+    cd \"\$HOME\"
+    trace=/tmp/ai-sandbox-codex-deskbot-trace.jsonl
+    image=/tmp/ai-sandbox-codex-deskbot.jpg
+    rm -f \"\$image\"
+    printf '%s\n' '<!doctype html>' '<title>ai-sandbox-codex</title>' '<body style=\"margin:0;background:#ff00ff;color:white;font:48px sans-serif\">AI Sandbox Codex Deskbot Doctor</body>' >/tmp/ai-sandbox-codex-deskbot.html
     # codex exec may clean up background child processes between separate
     # command executions. Keep browser launch, paint wait, and screenshot in
     # one command execution so the browser is alive when pixels are captured.
-    prompt="Read ~/.codex/skills/cua-browser/SKILL.md if present. Then run one shell command execution that resets stale Chromium windows, opens file:///tmp/ai-sandbox-codex-cuabot.html in Chromium, waits at least 6 seconds for the page to paint, and takes a screenshot exactly at /tmp/ai-sandbox-codex-cuabot.jpg. Do not split the launch and screenshot into separate command executions. The command should be equivalent to: cuabot --reset && cuabot --bash \"chromium --new-window file:///tmp/ai-sandbox-codex-cuabot.html >/tmp/cuabot-chromium.log 2>&1 & sleep 6; cuabot --screenshot /tmp/ai-sandbox-codex-cuabot.jpg\". Do not edit files."
-    timeout 600 codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$prompt" </dev/null >"$trace" 2>&1
-    python3 - "$trace" "$commands_json" <<'"'"'PY'"'"'
-import json
-import sys
-
-commands = []
-with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
-    for line in handle:
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        item = obj.get("item")
-        if isinstance(item, dict) and item.get("type") == "command_execution":
-            commands.append({
-                "command": item.get("command", ""),
-                "exit_code": item.get("exit_code"),
-                "status": item.get("status"),
-            })
-
-with open(sys.argv[2], "w", encoding="utf-8") as handle:
-    json.dump(commands, handle, indent=2)
-
-joined = "\n".join(str(command.get("command", "")) for command in commands).lower()
-forbidden = ["ffmpeg", "xdotool", "gnome-screenshot", "127.0.0.1:8000", "127.0.0.1:28000"]
-if "cuabot" not in joined:
-    print("Codex trace did not execute cuabot", file=sys.stderr)
-    sys.exit(1)
-if "--screenshot" not in joined:
-    print("Codex trace did not execute cuabot --screenshot", file=sys.stderr)
-    sys.exit(1)
-for word in forbidden:
-    if word in joined:
-        print(f"Codex trace used forbidden path: {word}", file=sys.stderr)
-        sys.exit(1)
-for command in commands:
-    status = command.get("status")
-    exit_code = command.get("exit_code")
-    if status in ("failed", "error") or (exit_code is not None and exit_code != 0):
-        print(f"Codex command failed: {command}", file=sys.stderr)
-        sys.exit(1)
-
-completed = [
-    str(command.get("command", "")).lower()
-    for command in commands
-    if command.get("status") == "completed" and command.get("exit_code") == 0
-]
-if not any("cuabot" in command and "--screenshot" in command for command in completed):
-    print("Codex trace did not complete a successful cuabot screenshot command", file=sys.stderr)
-    sys.exit(1)
-PY
-    python3 - "$image" <<'"'"'PY'"'"'
-from PIL import Image
-import sys
-
-image = Image.open(sys.argv[1]).convert("RGB")
-magenta = 0
-for r, g, b in image.getdata():
-    if r > 200 and g < 80 and b > 200:
-        magenta += 1
-
-if magenta < 10000:
-    print(f"expected magenta Codex screenshot pixels, found {magenta}", file=sys.stderr)
-    sys.exit(1)
-print(f"Codex screenshot magenta pixels: {magenta}")
-PY
-  '
+    prompt='Read ~/.codex/skills/deskbot/SKILL.md if present. Then run one shell command execution that resets stale Chromium windows, opens file:///tmp/ai-sandbox-codex-deskbot.html in Chromium, waits at least 6 seconds for the page to paint, and takes a screenshot exactly at /tmp/ai-sandbox-codex-deskbot.jpg. Do not split the launch and screenshot into separate command executions. The command should be equivalent to: deskbot --reset && deskbot --bash \"chromium --new-window file:///tmp/ai-sandbox-codex-deskbot.html >/tmp/deskbot-chromium.log 2>&1 & sleep 6; deskbot --screenshot /tmp/ai-sandbox-codex-deskbot.jpg\". Do not edit files.'
+    timeout 600 codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \"\$prompt\" </dev/null >\"\$trace\" 2>&1
+    python3 '${vm_doctor}/check_agent_trace.py' \"\$trace\" /tmp/ai-sandbox-codex-deskbot-commands.json
+    python3 '${vm_doctor}/check_pixels.py' \"\$image\"
+  "
+  check_doctor "VM Claude deskbot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
+    set -euo pipefail
+    cd \"\$HOME\"
+    image=/tmp/ai-sandbox-claude-deskbot.jpg
+    rm -f \"\$image\"
+    printf '%s\n' '<!doctype html>' '<title>ai-sandbox-claude</title>' '<body style=\"margin:0;background:#ff00ff;color:white;font:48px sans-serif\">AI Sandbox Claude Deskbot Doctor</body>' >/tmp/ai-sandbox-claude-deskbot.html
+    prompt='Read ~/.codex/skills/deskbot/SKILL.md if present. Then run one shell command that resets stale Chromium windows, opens file:///tmp/ai-sandbox-claude-deskbot.html in Chromium, waits at least 6 seconds for the page to paint, and takes a screenshot exactly at /tmp/ai-sandbox-claude-deskbot.jpg. Use deskbot only; do not use ffmpeg, xdotool, or HTTP APIs. The command should be equivalent to: deskbot --reset && deskbot --bash \"chromium --new-window file:///tmp/ai-sandbox-claude-deskbot.html >/tmp/deskbot-chromium.log 2>&1 & sleep 6; deskbot --screenshot /tmp/ai-sandbox-claude-deskbot.jpg\". Do not edit files.'
+    timeout 600 claude -p --dangerously-skip-permissions \"\$prompt\" </dev/null >/tmp/ai-sandbox-claude-deskbot.out 2>&1
+    python3 '${vm_doctor}/check_pixels.py' \"\$image\"
+  "
 
   rm -f /tmp/ai-sandbox-doctor.out /tmp/ai-sandbox-doctor.err
   [ "$failures" -eq 0 ] || die "${failures} doctor check(s) failed"
@@ -1285,6 +1172,7 @@ cmd_create() {
     else
       port_base="$(find_free_port_base "$DEFAULT_PORT_BASE")"
     fi
+    check_port_block_free "$port_base"
     log "Importing ${name} from ${archive}"
     lxc import "$archive" "$name"
     finalize_cloned_box "$name" "$port_base" "$ssh_bind" "$novnc_bind" "$cua_bind"
@@ -1317,6 +1205,7 @@ cmd_create() {
   sync_repo_to_vm "$name" "$user"
   ensure_box_ssh_key "$name" "$user"
   sync_host_codex_profile "$name" "$user"
+  sync_host_claude_profile "$name" "$user"
   run_install "$name" "$user" no
   write_ssh_config "$name" "$user" "$SSH_PORT"
   cmd_doctor "$name"
@@ -1335,7 +1224,7 @@ cmd_update() {
   start_instance "$name"
   wait_for_lxc "$name"
   set_vm_hostname "$name"
-  legacy_or_new_box_env "$name"
+  load_box_env "$name" || die "No box.env found for ${name}; this box predates managed config"
   ensure_user "$name" "$SANDBOX_USER"
   configure_base_lxd "$name"
   configure_proxy_devices "$name" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" yes
@@ -1343,6 +1232,7 @@ cmd_update() {
   sync_repo_to_vm "$name" "$SANDBOX_USER"
   ensure_box_ssh_key "$name" "$SANDBOX_USER"
   sync_host_codex_profile "$name" "$SANDBOX_USER"
+  sync_host_claude_profile "$name" "$SANDBOX_USER"
   run_install "$name" "$SANDBOX_USER" yes
   write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
   cmd_doctor "$name"
@@ -1587,13 +1477,13 @@ print_list_row() {
   local name="$1"
   local status="$2"
   if load_box_env "$name" >/dev/null 2>&1; then
-    effective_proxy "$name" ai-sandbox-ssh host-ssh "$SSH_BIND" "$SSH_PORT"
+    effective_proxy "$name" ai-sandbox-ssh "$SSH_BIND" "$SSH_PORT"
     local ssh_bind="$EFFECTIVE_BIND"
     local ssh_port="$EFFECTIVE_PORT"
-    effective_proxy "$name" ai-sandbox-novnc host-novnc "$NOVNC_BIND" "$NOVNC_PORT"
+    effective_proxy "$name" ai-sandbox-novnc "$NOVNC_BIND" "$NOVNC_PORT"
     local novnc_bind="$EFFECTIVE_BIND"
     local novnc_port="$EFFECTIVE_PORT"
-    effective_proxy "$name" ai-sandbox-cua host-cua "$CUA_BIND" "$CUA_PORT"
+    effective_proxy "$name" ai-sandbox-cua "$CUA_BIND" "$CUA_PORT"
     local cua_bind="$EFFECTIVE_BIND"
     local cua_port="$EFFECTIVE_PORT"
     local novnc_host exposure
@@ -1621,13 +1511,13 @@ print_list_detail() {
     return
   fi
 
-  effective_proxy "$name" ai-sandbox-ssh host-ssh "$SSH_BIND" "$SSH_PORT"
+  effective_proxy "$name" ai-sandbox-ssh "$SSH_BIND" "$SSH_PORT"
   local ssh_bind="$EFFECTIVE_BIND"
   local ssh_port="$EFFECTIVE_PORT"
-  effective_proxy "$name" ai-sandbox-novnc host-novnc "$NOVNC_BIND" "$NOVNC_PORT"
+  effective_proxy "$name" ai-sandbox-novnc "$NOVNC_BIND" "$NOVNC_PORT"
   local novnc_bind="$EFFECTIVE_BIND"
   local novnc_port="$EFFECTIVE_PORT"
-  effective_proxy "$name" ai-sandbox-cua host-cua "$CUA_BIND" "$CUA_PORT"
+  effective_proxy "$name" ai-sandbox-cua "$CUA_BIND" "$CUA_PORT"
   local cua_bind="$EFFECTIVE_BIND"
   local cua_port="$EFFECTIVE_PORT"
   local key_path="${SSH_KEY_DIR}/${name}_ed25519"
@@ -1688,7 +1578,6 @@ cmd_destroy() {
   remove_managed_known_host "$name"
   log "Removing per-box SSH keypair for ${name}"
   rm -f "${SSH_KEY_DIR}/${name}_ed25519" "${SSH_KEY_DIR}/${name}_ed25519.pub"
-  rm -f "${LEGACY_SSH_KEY_DIR}/${name}_ed25519" "${LEGACY_SSH_KEY_DIR}/${name}_ed25519.pub"
   log "Removing host box config mirror for ${name}"
   rm -f "$(host_box_env_path "$name")"
   log "Deleting LXD instance ${name}"
@@ -1703,10 +1592,6 @@ cmd_destroy() {
 main() {
   local cmd="${1:-help}"
   shift || true
-  case "$cmd" in
-    help|-h|--help) ;;
-    *) migrate_legacy_ssh_state ;;
-  esac
   case "$cmd" in
     create) cmd_create "$@" ;;
     update) cmd_update "$@" ;;

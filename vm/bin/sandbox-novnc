@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Env comes from the unit's EnvironmentFile=/etc/ai-sandbox.env (root-read).
+until nc -z 127.0.0.1 "${VNC_PORT:-5901}"; do
+  sleep 1
+done
+cd /opt/noVNC
+exec /opt/noVNC/utils/novnc_proxy \
+  --vnc "127.0.0.1:${VNC_PORT:-5901}" \
+  --listen "127.0.0.1:${NOVNC_PORT:-6901}"

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Env comes from the unit's EnvironmentFile=/etc/ai-sandbox.env (root-read).
+until xdpyinfo -display :1 >/dev/null 2>&1; do
+  sleep 1
+done
+# cua computer-server is the canonical programmatic computer-use API for this
+# box (upstream "host mode"). It drives the same display noVNC shows.
+exec /opt/cua-computer-server/bin/python -m computer_server \
+  --host 127.0.0.1 \
+  --port "${API_PORT:-8000}" \
+  --backend vnc \
+  --vnc-host "127.0.0.1" \
+  --vnc-port "${VNC_PORT:-5901}" \
+  --vnc-password "${VNC_PW}" \
+  --log-level info

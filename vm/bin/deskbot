@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# deskbot - drives the box's native desktop (the same display noVNC shows).
+# It is a thin xdotool/xwd client for shell-driven agents. The canonical
+# programmatic API for the same desktop is cua computer-server on port 8000.
+
+export DISPLAY="${DESKBOT_DISPLAY:-:1}"
+if [ -z "${XAUTHORITY:-}" ] && [ -f "$HOME/.Xauthority" ]; then
+  export XAUTHORITY="$HOME/.Xauthority"
+fi
+
+usage() {
+  cat <<'USAGE'
+deskbot - AI Sandbox native desktop controller
+
+Commands:
+  --status                  Check the native desktop
+  --reset                   Close stale browser windows on the native desktop
+  --bash <command>          Run a shell command with DISPLAY set to the native desktop
+  --screenshot [path]       Save a JPEG screenshot of the native desktop
+  --click x y [button]      Click at coordinates
+  --doubleclick x y         Double-click at coordinates
+  --move x y                Move pointer
+  --mousedown x y [button]  Press mouse button at coordinates
+  --mouseup x y [button]    Release mouse button at coordinates
+  --drag x1 y1 x2 y2        Drag from one coordinate to another
+  --scroll x y dx dy        Scroll at coordinates
+  --type <text>             Type text into the focused window
+  --key <key>               Press a key, for example Enter or ctrl+l
+  --keydown <key>           Hold a key down
+  --keyup <key>             Release a key
+  --help                    Show this help
+USAGE
+}
+
+die() {
+  printf 'deskbot: %s\n' "$*" >&2
+  exit 1
+}
+
+need_args() {
+  local want="$1"
+  local have="$2"
+  local name="$3"
+  [ "$have" -ge "$want" ] || die "${name} needs ${want} argument(s)"
+}
+
+require_display() {
+  if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+    die "native desktop is not ready on DISPLAY=${DISPLAY}"
+  fi
+}
+
+button_number() {
+  case "${1:-left}" in
+    left|1) printf '1' ;;
+    middle|2) printf '2' ;;
+    right|3) printf '3' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+screenshot() {
+  local output="${1:-/tmp/deskbot-screenshot.jpg}"
+  local tmp
+  mkdir -p "$(dirname "$output")"
+  tmp="$(mktemp --tmpdir deskbot-screenshot.XXXXXX.xwd)"
+  require_display
+  if ! xwd -display "$DISPLAY" -root -silent -out "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! xwdtopnm "$tmp" 2>/dev/null | pnmtojpeg >"$output"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+  printf 'Screenshot saved to %s\n' "$output"
+}
+
+reset_desktop() {
+  pkill -TERM -f '[h]eadless_shell' >/dev/null 2>&1 || true
+  pkill -TERM -f '/opt/ms-playwright/.*/[c]hrome' >/dev/null 2>&1 || true
+  pkill -TERM -x chromium >/dev/null 2>&1 || true
+  pkill -TERM -x chrome >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    if ! pgrep -u "$(id -u)" -f '[h]eadless_shell|/opt/ms-playwright/.*/[c]hrome' >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.25
+  done
+  pkill -KILL -f '[h]eadless_shell' >/dev/null 2>&1 || true
+  pkill -KILL -f '/opt/ms-playwright/.*/[c]hrome' >/dev/null 2>&1 || true
+
+  # Cloned or crashed persistent profiles can retain Chromium's process
+  # singleton files, which make Chromium think the profile is still open on
+  # the source hostname. Remove only those locks after all browser processes
+  # are gone; keep the actual profile/OAuth state intact.
+  cd "$HOME"
+  for dir in "$HOME/.config/chromium" "$HOME/.config/google-chrome"; do
+    [ -d "$dir" ] || continue
+    find "$dir" -maxdepth 1 \( -name 'SingletonLock' -o -name 'SingletonSocket' -o -name 'SingletonCookie' \) -delete
+  done
+
+  sleep 1
+  printf 'Native desktop reset on DISPLAY=%s\n' "$DISPLAY"
+}
+
+run_xdotool() {
+  require_display
+  xdotool "$@"
+}
+
+[ "$#" -gt 0 ] || { usage; exit 0; }
+
+case "$1" in
+  --help|-h)
+    usage
+    ;;
+  --status)
+    require_display
+    printf 'Native desktop ready on DISPLAY=%s\n' "$DISPLAY"
+    ;;
+  --reset)
+    require_display
+    reset_desktop
+    ;;
+  --bash)
+    shift
+    need_args 1 "$#" "--bash"
+    require_display
+    bash -lc "$*"
+    ;;
+  --screenshot)
+    shift
+    screenshot "${1:-/tmp/deskbot-screenshot.jpg}"
+    ;;
+  --click)
+    shift
+    need_args 2 "$#" "--click"
+    x="$1"; y="$2"; button="$(button_number "${3:-left}")"
+    run_xdotool mousemove --sync "$x" "$y" click "$button"
+    ;;
+  --doubleclick)
+    shift
+    need_args 2 "$#" "--doubleclick"
+    run_xdotool mousemove --sync "$1" "$2" click --repeat 2 --delay 100 1
+    ;;
+  --move)
+    shift
+    need_args 2 "$#" "--move"
+    run_xdotool mousemove --sync "$1" "$2"
+    ;;
+  --mousedown)
+    shift
+    need_args 2 "$#" "--mousedown"
+    x="$1"; y="$2"; button="$(button_number "${3:-left}")"
+    run_xdotool mousemove --sync "$x" "$y" mousedown "$button"
+    ;;
+  --mouseup)
+    shift
+    need_args 2 "$#" "--mouseup"
+    x="$1"; y="$2"; button="$(button_number "${3:-left}")"
+    run_xdotool mousemove --sync "$x" "$y" mouseup "$button"
+    ;;
+  --drag)
+    shift
+    need_args 4 "$#" "--drag"
+    run_xdotool mousemove --sync "$1" "$2" mousedown 1 mousemove --sync "$3" "$4" mouseup 1
+    ;;
+  --scroll)
+    shift
+    need_args 4 "$#" "--scroll"
+    x="$1"; y="$2"; dx="$3"; dy="$4"
+    run_xdotool mousemove --sync "$x" "$y"
+    scroll_axis() {
+      local delta="$1" neg_button="$2" pos_button="$3"
+      [ "$delta" != "0" ] || return 0
+      local delta_abs="${delta#-}"
+      local steps=$(( (delta_abs + 119) / 120 ))
+      [ "$steps" -gt 0 ] || steps=1
+      local button
+      if [ "${delta#-}" != "$delta" ]; then
+        button="$neg_button"
+      else
+        button="$pos_button"
+      fi
+      for _ in $(seq 1 "$steps"); do
+        run_xdotool click "$button"
+      done
+    }
+    scroll_axis "$dy" 4 5
+    scroll_axis "$dx" 6 7
+    ;;
+  --type)
+    shift
+    need_args 1 "$#" "--type"
+    run_xdotool type --clearmodifiers --delay "${DESKBOT_TYPE_DELAY:-20}" -- "$*"
+    ;;
+  --key)
+    shift
+    need_args 1 "$#" "--key"
+    run_xdotool key --clearmodifiers "$@"
+    ;;
+  --keydown)
+    shift
+    need_args 1 "$#" "--keydown"
+    run_xdotool keydown "$@"
+    ;;
+  --keyup)
+    shift
+    need_args 1 "$#" "--keyup"
+    run_xdotool keyup "$@"
+    ;;
+  *)
+    die "unknown command: $1"
+    ;;
+esac

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# There is no system chromium in these boxes (Ubuntu's is a snap, which does
+# not work in LXC). This launcher gives Playwright's versioned chrome binary a
+# stable name, a persistent profile, and the flags needed inside a container.
+chrome="$(find /opt/ms-playwright -path '*/chrome-linux/chrome' -type f | sort | tail -n 1)"
+if [ -z "$chrome" ]; then
+  echo "Playwright Chromium executable not found under /opt/ms-playwright" >&2
+  exit 1
+fi
+profile="${CHROMIUM_USER_DATA_DIR:-$HOME/.config/chromium}"
+mkdir -p "$profile"
+exec "$chrome" \
+  --no-sandbox \
+  --disable-dev-shm-usage \
+  --password-store=basic \
+  --user-data-dir="$profile" \
+  "$@"

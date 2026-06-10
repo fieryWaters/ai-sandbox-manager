@@ -8,6 +8,8 @@ log() { printf '[ai-sandbox-install] %s\n' "$*"; }
 
 [ "$(id -u)" -eq 0 ] || die "Run install.sh as root"
 
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 apt_get() {
   local attempt=1
   local max_attempts=60
@@ -96,7 +98,7 @@ load_box_env() {
 
   SANDBOX_USER="${SANDBOX_USER:-agent}"
   PORT_BASE="${PORT_BASE:-2230}"
-  VNC_PASSWORD="${VNC_PASSWORD:-youart-agent}"
+  [ -n "$VNC_PASSWORD" ] || die "box.env is missing VNC_PASSWORD"
   validate_user "$SANDBOX_USER"
   validate_port "$PORT_BASE"
 }
@@ -113,12 +115,15 @@ USER_HOME="$(getent passwd "$SANDBOX_USER" | cut -d: -f6)"
 
 SANDBOX_DIR="${USER_HOME}/.ai-sandbox"
 LOG_DIR="${SANDBOX_DIR}/logs"
-REPO_DIR="${SANDBOX_DIR}/ai-sandbox-manager"
 install -d -m 700 -o "$SANDBOX_USER" -g "$SANDBOX_USER" "$SANDBOX_DIR" "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/install-$(date -u +%Y%m%dT%H%M%SZ).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 log "Installing managed tooling for ${SANDBOX_USER}"
+
+# ---------------------------------------------------------------------------
+# Packages: apt, NodeSource node, NVIDIA container runtime
+# ---------------------------------------------------------------------------
 
 install -d -m 0755 /etc/apt/keyrings
 if [ ! -f /etc/apt/keyrings/nodesource.gpg ]; then
@@ -166,277 +171,37 @@ else
   log "Skipping NVIDIA container runtime setup"
 fi
 
+# ---------------------------------------------------------------------------
+# Desktop stack: noVNC, cua computer-server, agent CLIs, Playwright Chromium
+# ---------------------------------------------------------------------------
+
 log "Installing noVNC"
 rm -rf /opt/noVNC
 git clone --depth 1 https://github.com/trycua/noVNC.git /opt/noVNC
 git clone --depth 1 https://github.com/novnc/websockify /opt/noVNC/utils/websockify
 ln -sf /opt/noVNC/vnc.html /opt/noVNC/index.html
 
-log "Installing CUA computer-server fallback"
+log "Installing cua computer-server"
 rm -rf /opt/cua-computer-server
 python3 -m venv /opt/cua-computer-server
 /opt/cua-computer-server/bin/pip install --upgrade pip setuptools wheel
 /opt/cua-computer-server/bin/pip install 'cua-computer-server[vnc]'
 
-log "Installing Codex and Playwright"
+log "Installing Codex, Claude Code, and Playwright"
 # Older sandbox builds installed Codex under /usr/local, which shadows the
 # current NodeSource npm global prefix (/usr) on PATH. Remove that stale copy so
 # update always repairs the agent to the freshly installed managed CLI.
 rm -f /usr/local/bin/codex
 rm -rf /usr/local/lib/node_modules/@openai/codex
-npm install -g @openai/codex playwright
+npm install -g @openai/codex @anthropic-ai/claude-code playwright
 PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install --with-deps chromium
 
-cat >/usr/local/bin/chromium <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-chrome="$(find /opt/ms-playwright -path '*/chrome-linux/chrome' -type f | sort | tail -n 1)"
-if [ -z "$chrome" ]; then
-  echo "Playwright Chromium executable not found under /opt/ms-playwright" >&2
-  exit 1
-fi
-profile="${CHROMIUM_USER_DATA_DIR:-$HOME/.config/chromium}"
-mkdir -p "$profile"
-exec "$chrome" \
-  --no-sandbox \
-  --disable-dev-shm-usage \
-  --password-store=basic \
-  --user-data-dir="$profile" \
-  "$@"
-EOF
-chmod +x /usr/local/bin/chromium
-update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/chromium 100
-update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser /usr/local/bin/chromium 100
-
-cat >/usr/local/bin/cuabot <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-export DISPLAY="${CUABOT_DISPLAY:-:1}"
-if [ -z "${XAUTHORITY:-}" ] && [ -f "$HOME/.Xauthority" ]; then
-  export XAUTHORITY="$HOME/.Xauthority"
-fi
-
-usage() {
-  cat <<'USAGE'
-cuabot - native AI Sandbox desktop controller
-
-Commands:
-  --status                  Check the native desktop
-  --reset                   Close stale Chromium windows on the native desktop
-  --bash <command>          Run a shell command with DISPLAY set to the native desktop
-  --screenshot [path]       Save a JPEG screenshot of the native desktop
-  --click x y [button]      Click at coordinates
-  --doubleclick x y         Double-click at coordinates
-  --move x y                Move pointer
-  --mousedown x y [button]  Press mouse button at coordinates
-  --mouseup x y [button]    Release mouse button at coordinates
-  --drag x1 y1 x2 y2        Drag from one coordinate to another
-  --scroll x y dx dy        Scroll at coordinates
-  --type <text>             Type text into the focused window
-  --key <key>               Press a key, for example Enter or ctrl+l
-  --keydown <key>           Hold a key down
-  --keyup <key>             Release a key
-  --stop                    No-op; the native desktop is managed by systemd
-  --serve                   No-op; the native desktop is managed by systemd
-  --help                    Show this help
-USAGE
-}
-
-die() {
-  printf 'cuabot: %s\n' "$*" >&2
-  exit 1
-}
-
-need_args() {
-  local want="$1"
-  local have="$2"
-  local name="$3"
-  [ "$have" -ge "$want" ] || die "${name} needs ${want} argument(s)"
-}
-
-require_display() {
-  if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
-    die "native desktop is not ready on DISPLAY=${DISPLAY}"
-  fi
-}
-
-button_number() {
-  case "${1:-left}" in
-    left|1) printf '1' ;;
-    middle|2) printf '2' ;;
-    right|3) printf '3' ;;
-    *) printf '%s' "$1" ;;
-  esac
-}
-
-screenshot() {
-  local output="${1:-/tmp/cuabot-screenshot.jpg}"
-  local tmp
-  mkdir -p "$(dirname "$output")"
-  tmp="$(mktemp --tmpdir cuabot-screenshot.XXXXXX.xwd)"
-  require_display
-  if ! xwd -display "$DISPLAY" -root -silent -out "$tmp"; then
-    rm -f "$tmp"
-    return 1
-  fi
-  if ! xwdtopnm "$tmp" 2>/dev/null | pnmtojpeg >"$output"; then
-    rm -f "$tmp"
-    return 1
-  fi
-  rm -f "$tmp"
-  printf 'Screenshot saved to %s\n' "$output"
-}
-
-reset_desktop() {
-  pkill -TERM -f '[n]pm exec cuabot --serve' >/dev/null 2>&1 || true
-  pkill -TERM -f '[s]h -c cuabot --serve' >/dev/null 2>&1 || true
-  pkill -TERM -f '[n]ode /usr/bin/cuabot --serve' >/dev/null 2>&1 || true
-  pkill -TERM -f '[h]eadless_shell' >/dev/null 2>&1 || true
-  pkill -TERM -f '/opt/ms-playwright/.*/[c]hrome' >/dev/null 2>&1 || true
-  pkill -TERM -x chromium >/dev/null 2>&1 || true
-  pkill -TERM -x chrome >/dev/null 2>&1 || true
-  for _ in $(seq 1 20); do
-    if ! pgrep -u "$(id -u)" -f '[n]pm exec cuabot --serve|[s]h -c cuabot --serve|[n]ode /usr/bin/cuabot --serve|[h]eadless_shell|/opt/ms-playwright/.*/[c]hrome' >/dev/null 2>&1; then
-      break
-    fi
-    sleep 0.25
-  done
-  pkill -KILL -f '[n]pm exec cuabot --serve' >/dev/null 2>&1 || true
-  pkill -KILL -f '[s]h -c cuabot --serve' >/dev/null 2>&1 || true
-  pkill -KILL -f '[n]ode /usr/bin/cuabot --serve' >/dev/null 2>&1 || true
-  pkill -KILL -f '[h]eadless_shell' >/dev/null 2>&1 || true
-  pkill -KILL -f '/opt/ms-playwright/.*/[c]hrome' >/dev/null 2>&1 || true
-
-  # Cloned or crashed persistent profiles can retain Chromium's process
-  # singleton files, which make Chromium think the profile is still open on
-  # the source hostname. Remove only those locks after all browser processes
-  # are gone; keep the actual profile/OAuth state intact.
-  cd "$HOME"
-  for dir in "$HOME/.config/chromium" "$HOME/.config/google-chrome"; do
-    [ -d "$dir" ] || continue
-    find "$dir" -maxdepth 1 \( -name 'SingletonLock' -o -name 'SingletonSocket' -o -name 'SingletonCookie' \) -delete
-  done
-
-  sleep 1
-  printf 'Native desktop reset on DISPLAY=%s\n' "$DISPLAY"
-}
-
-run_xdotool() {
-  require_display
-  xdotool "$@"
-}
-
-[ "$#" -gt 0 ] || { usage; exit 0; }
-
-case "$1" in
-  --help|-h)
-    usage
-    ;;
-  --status)
-    require_display
-    printf 'Native desktop ready on DISPLAY=%s\n' "$DISPLAY"
-    ;;
-  --reset)
-    require_display
-    reset_desktop
-    ;;
-  --bash)
-    shift
-    need_args 1 "$#" "--bash"
-    require_display
-    bash -lc "$*"
-    ;;
-  --screenshot)
-    shift
-    screenshot "${1:-/tmp/cuabot-screenshot.jpg}"
-    ;;
-  --click)
-    shift
-    need_args 2 "$#" "--click"
-    x="$1"; y="$2"; button="$(button_number "${3:-left}")"
-    run_xdotool mousemove --sync "$x" "$y" click "$button"
-    ;;
-  --doubleclick)
-    shift
-    need_args 2 "$#" "--doubleclick"
-    run_xdotool mousemove --sync "$1" "$2" click --repeat 2 --delay 100 1
-    ;;
-  --move)
-    shift
-    need_args 2 "$#" "--move"
-    run_xdotool mousemove --sync "$1" "$2"
-    ;;
-  --mousedown)
-    shift
-    need_args 2 "$#" "--mousedown"
-    x="$1"; y="$2"; button="$(button_number "${3:-left}")"
-    run_xdotool mousemove --sync "$x" "$y" mousedown "$button"
-    ;;
-  --mouseup)
-    shift
-    need_args 2 "$#" "--mouseup"
-    x="$1"; y="$2"; button="$(button_number "${3:-left}")"
-    run_xdotool mousemove --sync "$x" "$y" mouseup "$button"
-    ;;
-  --drag)
-    shift
-    need_args 4 "$#" "--drag"
-    run_xdotool mousemove --sync "$1" "$2" mousedown 1 mousemove --sync "$3" "$4" mouseup 1
-    ;;
-  --scroll)
-    shift
-    need_args 4 "$#" "--scroll"
-    x="$1"; y="$2"; dy="$4"
-    [ "$dy" = "0" ] && exit 0
-    dy_abs="${dy#-}"
-    steps=$(( (dy_abs + 119) / 120 ))
-    [ "$steps" -gt 0 ] || steps=1
-    if [ "$dy" -lt 0 ]; then
-      button=4
-    else
-      button=5
-    fi
-    run_xdotool mousemove --sync "$x" "$y"
-    for _ in $(seq 1 "$steps"); do
-      run_xdotool click "$button"
-    done
-    ;;
-  --type)
-    shift
-    need_args 1 "$#" "--type"
-    run_xdotool type --clearmodifiers --delay "${CUABOT_TYPE_DELAY:-20}" -- "$*"
-    ;;
-  --key)
-    shift
-    need_args 1 "$#" "--key"
-    run_xdotool key --clearmodifiers "$@"
-    ;;
-  --keydown)
-    shift
-    need_args 1 "$#" "--keydown"
-    run_xdotool keydown "$@"
-    ;;
-  --keyup)
-    shift
-    need_args 1 "$#" "--keyup"
-    run_xdotool keyup "$@"
-    ;;
-  --stop)
-    printf 'Native desktop is managed by systemd; no nested cuabot server to stop.\n'
-    ;;
-  --serve)
-    printf 'Native desktop is managed by systemd; no nested cuabot server is started.\n'
-    ;;
-  *)
-    die "unknown command: $1"
-    ;;
-esac
-EOF
-chmod +x /usr/local/bin/cuabot
+# ---------------------------------------------------------------------------
+# Managed files: env, executables, systemd units (all checked in under vm/)
+# ---------------------------------------------------------------------------
 
 log "Writing managed service environment"
-cat >/etc/youart-agent.env <<EOF
+cat >/etc/ai-sandbox.env <<EOF
 AGENT_USER=${SANDBOX_USER}
 HOME=${USER_HOME}
 USER=${SANDBOX_USER}
@@ -447,136 +212,29 @@ VNC_COL_DEPTH=24
 VNC_PORT=5901
 NOVNC_PORT=6901
 API_PORT=8000
-CUA_VNC_HOST=127.0.0.1
-CUA_VNC_PORT=5901
-CUA_VNC_PASSWORD=${VNC_PASSWORD}
 EOF
-chmod 0644 /etc/youart-agent.env
+chmod 0600 /etc/ai-sandbox.env
 
-cat >/usr/local/bin/youart-xstartup <<'EOF'
-#!/usr/bin/env bash
-unset SESSION_MANAGER
-unset DBUS_SESSION_BUS_ADDRESS
-export XKL_XMODMAP_DISABLE=1
-exec startxfce4
-EOF
-chmod +x /usr/local/bin/youart-xstartup
-
-cat >/usr/local/bin/youart-start-vnc <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-source /etc/youart-agent.env
-rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
-mkdir -p "$HOME/.vnc"
-echo "$VNC_PW" | vncpasswd -f > "$HOME/.vnc/passwd"
-chmod 600 "$HOME/.vnc/passwd"
-vncserver :1 \
-  -geometry "${VNC_RESOLUTION:-1280x800}" \
-  -depth "${VNC_COL_DEPTH:-24}" \
-  -rfbport "${VNC_PORT:-5901}" \
-  -localhost no \
-  -SecurityTypes VncAuth \
-  -rfbauth "$HOME/.vnc/passwd" \
-  -AlwaysShared \
-  -AcceptPointerEvents \
-  -AcceptKeyEvents \
-  -AcceptCutText \
-  -SendCutText \
-  -xstartup /usr/local/bin/youart-xstartup
-tail -F "$HOME"/.vnc/*.log
-EOF
-chmod +x /usr/local/bin/youart-start-vnc
-
-cat >/usr/local/bin/youart-start-novnc <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-source /etc/youart-agent.env
-until nc -z 127.0.0.1 "${VNC_PORT:-5901}"; do
-  sleep 1
+log "Installing managed executables and services from vm/"
+install -m 0755 "$REPO_DIR"/vm/bin/* /usr/local/bin/
+for unit in "$REPO_DIR"/vm/systemd/*.service; do
+  sed -e "s|@AGENT_USER@|${SANDBOX_USER}|g" \
+      -e "s|@AGENT_HOME@|${USER_HOME}|g" \
+      "$unit" >"/etc/systemd/system/$(basename "$unit")"
 done
-cd /opt/noVNC
-exec /opt/noVNC/utils/novnc_proxy \
-  --vnc "127.0.0.1:${VNC_PORT:-5901}" \
-  --listen "0.0.0.0:${NOVNC_PORT:-6901}"
-EOF
-chmod +x /usr/local/bin/youart-start-novnc
 
-cat >/usr/local/bin/youart-start-cua-server <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-source /etc/youart-agent.env
-until xdpyinfo -display :1 >/dev/null 2>&1; do
-  sleep 1
-done
-exec /opt/cua-computer-server/bin/python -m computer_server \
-  --host 0.0.0.0 \
-  --port "${API_PORT:-8000}" \
-  --backend vnc \
-  --vnc-host "${CUA_VNC_HOST:-127.0.0.1}" \
-  --vnc-port "${CUA_VNC_PORT:-5901}" \
-  --vnc-password "${CUA_VNC_PASSWORD:-youart-agent}" \
-  --log-level info
-EOF
-chmod +x /usr/local/bin/youart-start-cua-server
+update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/chromium 100
+update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser /usr/local/bin/chromium 100
 
-cat >/etc/systemd/system/youart-vnc.service <<EOF
-[Unit]
-Description=AI Sandbox XFCE VNC Desktop
-After=network-online.target
-
-[Service]
-User=${SANDBOX_USER}
-EnvironmentFile=/etc/youart-agent.env
-WorkingDirectory=${USER_HOME}
-ExecStart=/usr/local/bin/youart-start-vnc
-ExecStop=-/usr/bin/vncserver -kill :1
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat >/etc/systemd/system/youart-novnc.service <<EOF
-[Unit]
-Description=AI Sandbox noVNC Web Desktop
-After=youart-vnc.service
-Requires=youart-vnc.service
-
-[Service]
-User=${SANDBOX_USER}
-EnvironmentFile=/etc/youart-agent.env
-WorkingDirectory=${USER_HOME}
-ExecStart=/usr/local/bin/youart-start-novnc
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat >/etc/systemd/system/youart-cua-server.service <<EOF
-[Unit]
-Description=AI Sandbox CUA Computer Server
-After=youart-vnc.service
-Requires=youart-vnc.service
-
-[Service]
-User=${SANDBOX_USER}
-EnvironmentFile=/etc/youart-agent.env
-WorkingDirectory=${USER_HOME}
-ExecStart=/usr/local/bin/youart-start-cua-server
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
+# ---------------------------------------------------------------------------
+# User state and agent profiles (Codex + Claude)
+# ---------------------------------------------------------------------------
 
 log "Preparing persistent user state directories"
 install -d -o "$SANDBOX_USER" -g "$SANDBOX_USER" \
   "$USER_HOME/.config/chromium" \
   "$USER_HOME/.codex" \
+  "$USER_HOME/.claude" \
   "$USER_HOME/.ssh" \
   "$USER_HOME/git-repos" \
   "$USER_HOME/workspace" \
@@ -599,29 +257,74 @@ if [ -d "$REPO_DIR/codex/skills" ]; then
   install -d -m 755 -o "$SANDBOX_USER" -g "$SANDBOX_USER" "$USER_HOME/.codex/skills"
   tar -C "$REPO_DIR/codex/skills" -cf - . \
     | tar -C "$USER_HOME/.codex/skills" -xf -
-  chown -R "$SANDBOX_USER:$SANDBOX_USER" "$USER_HOME/.codex"
 fi
 
-runuser -u "$SANDBOX_USER" -- bash -lc '
-  touch ~/.bashrc
-  sed -i \
-    -e "/^alias yolo=codex-yolo$/d" \
-    -e "/^alias cy=codex-yolo$/d" \
-    -e "/^alias codex=codex-yolo$/d" \
-    -e "/^alias codex='\''command codex --dangerously-bypass-approvals-and-sandbox'\''$/d" \
-    ~/.bashrc
-  grep -qxF "# Run Codex without approval prompts or sandboxing." ~/.bashrc || printf "\n# Run Codex without approval prompts or sandboxing.\n" >> ~/.bashrc
-  printf "%s\n" "alias codex='\''command codex --dangerously-bypass-approvals-and-sandbox'\''" >> ~/.bashrc
+# The git push guard is hook-based. Host-synced hooks win; otherwise install
+# the repo defaults so every box has the guard.
+if [ ! -f "$USER_HOME/.codex/hooks.json" ] && [ -f "$REPO_DIR/codex/hooks.json" ]; then
+  log "Installing repo default Codex hooks"
+  install -m 644 "$REPO_DIR/codex/hooks.json" "$USER_HOME/.codex/hooks.json"
+  install -d -m 755 "$USER_HOME/.codex/hooks"
+  install -m 755 "$REPO_DIR"/codex/hooks/*.py "$USER_HOME/.codex/hooks/"
+fi
+chown -R "$SANDBOX_USER:$SANDBOX_USER" "$USER_HOME/.codex"
+
+# Codex runs without approval prompts or sandboxing inside the box. This is
+# config, not a shell alias, so it applies to non-interactive sessions too.
+runuser -u "$SANDBOX_USER" -- bash -c '
+  set -e
   mkdir -p ~/.codex
   touch ~/.codex/config.toml
+  # Top-level TOML keys must precede any [table], so prepend.
+  sed -i -e "/^approval_policy *=/d" -e "/^sandbox_mode *=/d" ~/.codex/config.toml
+  printf "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n" \
+    | cat - ~/.codex/config.toml > ~/.codex/config.toml.new
+  mv ~/.codex/config.toml.new ~/.codex/config.toml
   for path in "$HOME" "$HOME/git-repos" "$HOME/.ai-sandbox/ai-sandbox-manager"; do
     if ! grep -Fq "[projects.\"${path}\"]" ~/.codex/config.toml; then
       printf "\n[projects.\"%s\"]\ntrust_level = \"trusted\"\n" "$path" >> ~/.codex/config.toml
     fi
   done
+  # Remove the legacy bashrc alias surgery; config.toml replaces it.
+  if [ -f ~/.bashrc ]; then
+    sed -i \
+      -e "/^alias yolo=codex-yolo$/d" \
+      -e "/^alias cy=codex-yolo$/d" \
+      -e "/^alias codex=codex-yolo$/d" \
+      -e "/^alias codex='"'"'command codex --dangerously-bypass-approvals-and-sandbox'"'"'$/d" \
+      -e "/^# Run Codex without approval prompts or sandboxing\.$/d" \
+      ~/.bashrc
+  fi
 '
 
-log "Removing legacy nested cuabot desktop state"
+# Claude Code: mark onboarding done so non-interactive use works. Credentials
+# and settings are synced from the host by the sandbox CLI.
+runuser -u "$SANDBOX_USER" -- bash -c '
+  set -e
+  if [ ! -f ~/.claude.json ]; then
+    printf "{\"hasCompletedOnboarding\": true, \"bypassPermissionsModeAccepted\": true}\n" > ~/.claude.json
+  else
+    jq ".hasCompletedOnboarding = true | .bypassPermissionsModeAccepted = true" ~/.claude.json > ~/.claude.json.new
+    mv ~/.claude.json.new ~/.claude.json
+  fi
+'
+
+# ---------------------------------------------------------------------------
+# Legacy cleanup and service activation
+# ---------------------------------------------------------------------------
+
+log "Removing legacy managed tooling"
+systemctl disable --now youart-cua-server.service youart-novnc.service youart-vnc.service >/dev/null 2>&1 || true
+rm -f \
+  /etc/systemd/system/youart-cua-server.service \
+  /etc/systemd/system/youart-novnc.service \
+  /etc/systemd/system/youart-vnc.service \
+  /usr/local/bin/youart-start-cua-server \
+  /usr/local/bin/youart-start-novnc \
+  /usr/local/bin/youart-start-vnc \
+  /usr/local/bin/youart-xstartup \
+  /usr/local/bin/cuabot \
+  /etc/youart-agent.env
 if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
   docker ps -a --format "{{.Names}}" \
     | awk '/^cuabot-xpra($|-)/ { print }' \
@@ -636,6 +339,6 @@ runuser -u "$SANDBOX_USER" -- bash -lc '
 ' || true
 
 systemctl daemon-reload
-systemctl enable --now youart-vnc.service youart-novnc.service youart-cua-server.service
+systemctl enable --now sandbox-vnc.service sandbox-novnc.service sandbox-cua-server.service
 
 log "Install complete"
