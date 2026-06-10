@@ -179,6 +179,11 @@ python3 -m venv /opt/cua-computer-server
 /opt/cua-computer-server/bin/pip install 'cua-computer-server[vnc]'
 
 log "Installing Codex and Playwright"
+# Older sandbox builds installed Codex under /usr/local, which shadows the
+# current NodeSource npm global prefix (/usr) on PATH. Remove that stale copy so
+# update always repairs the agent to the freshly installed managed CLI.
+rm -f /usr/local/bin/codex
+rm -rf /usr/local/lib/node_modules/@openai/codex
 npm install -g @openai/codex playwright
 PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install --with-deps chromium
 
@@ -302,6 +307,17 @@ reset_desktop() {
   pkill -KILL -f '[n]ode /usr/bin/cuabot --serve' >/dev/null 2>&1 || true
   pkill -KILL -f '[h]eadless_shell' >/dev/null 2>&1 || true
   pkill -KILL -f '/opt/ms-playwright/.*/[c]hrome' >/dev/null 2>&1 || true
+
+  # Cloned or crashed persistent profiles can retain Chromium's process
+  # singleton files, which make Chromium think the profile is still open on
+  # the source hostname. Remove only those locks after all browser processes
+  # are gone; keep the actual profile/OAuth state intact.
+  cd "$HOME"
+  for dir in "$HOME/.config/chromium" "$HOME/.config/google-chrome"; do
+    [ -d "$dir" ] || continue
+    find "$dir" -maxdepth 1 \( -name 'SingletonLock' -o -name 'SingletonSocket' -o -name 'SingletonCookie' \) -delete
+  done
+
   sleep 1
   printf 'Native desktop reset on DISPLAY=%s\n' "$DISPLAY"
 }

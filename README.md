@@ -9,6 +9,10 @@ Use the root CLI:
 ```bash
 sandbox create NAME [--port-base N] [--user USER]
 sandbox update NAME
+sandbox start NAME
+sandbox stop NAME
+sandbox copy SOURCE DEST
+sandbox export NAME [FILE]
 sandbox doctor NAME
 sandbox view NAME
 sandbox ssh NAME [-- command...]
@@ -22,9 +26,22 @@ The important invariants:
 - Spark must be able to run `ssh NAME`.
 - `sandbox view NAME` prints the noVNC URL for the box.
 - `sandbox update NAME` repairs the VM tooling from this repo.
+- `sandbox copy SOURCE DEST` is the day-to-day golden-box cloning path.
+- `sandbox export NAME` is the portable backup path.
 - Agents use `cuabot` for browser automation on the VM's native desktop.
 - noVNC is for human supervision of that same desktop.
 - CUA HTTP is installed only as fallback/debug.
+
+Host-side managed state lives under:
+
+```bash
+~/.ai-sandbox
+```
+
+That includes SSH keys, managed SSH config, known-host entries, host box config
+mirrors, and default archives. The only intentional touch outside that directory is a single
+`Include ~/.ai-sandbox/ssh/config` line in `~/.ssh/config`, so normal
+`ssh NAME` works.
 
 Before browser work, agents should run `cuabot --reset` to close stale Chromium windows/tabs. They should not delete the persistent Chromium profile because OAuth login state is intentional.
 
@@ -51,6 +68,74 @@ sandbox create agent-002 --user agent --port-base 2240
 ```
 
 `--user` is a create-time choice. Update reads the recorded user and does not migrate home directories.
+
+Create from a portable archive:
+
+```bash
+sandbox create agent-from-golden --from golden
+sandbox create agent-from-file --from /mnt/external_ssd/sandboxes/golden.tar.gz
+```
+
+If `--from` is a name rather than a file path, it resolves to:
+
+```bash
+~/.ai-sandbox/archives/NAME.tar.gz
+```
+
+Imported boxes keep the VM filesystem from the archive but receive fresh host
+ports, fresh host SSH keys, a fresh VNC/CUA password, rewritten managed config,
+and a VM hostname matching the new sandbox name. Imported exposure defaults to
+localhost unless `--public` or explicit bind flags are supplied.
+
+## Start And Stop
+
+```bash
+sandbox stop NAME
+sandbox start NAME
+```
+
+Stop preserves the LXD instance, `box.env`, SSH key, managed SSH config, and
+LXD proxy devices. Stopped boxes still reserve their configured three-port
+block, so new boxes will not accidentally reuse their ports.
+
+Start brings the instance back up, refreshes SSH config from `box.env`, waits
+for basic SSH, and prints the noVNC URL. Run `sandbox doctor NAME` when you
+want full validation.
+
+## Copy And Export
+
+For normal golden-box workflows, use copy:
+
+```bash
+sandbox stop youart-agent-golden
+sandbox copy youart-agent-golden agent-004
+```
+
+Copy uses LXD directly. The source must be stopped so the copied filesystem is
+consistent. The destination gets the next free contiguous port block, a fresh
+host SSH keypair, a fresh VNC/CUA password, a VM hostname matching the new
+sandbox name, and localhost-only exposure unless bind flags are supplied:
+
+```bash
+sandbox copy youart-agent-golden agent-public --public
+sandbox copy youart-agent-golden agent-mixed --ssh-bind 127.0.0.1 --novnc-bind 0.0.0.0 --cua-bind 127.0.0.1
+```
+
+For portable backups or moving a box between machines, use export:
+
+```bash
+sandbox stop youart-agent-golden
+sandbox export youart-agent-golden
+```
+
+Without an explicit path, export writes:
+
+```bash
+~/.ai-sandbox/archives/youart-agent-golden.tar.gz
+```
+
+The source must be stopped first. To restore, use `sandbox create NEW --from
+ARCHIVE_OR_NAME`.
 
 ## Exposure
 
@@ -91,11 +176,11 @@ user: agent
 
 ssh:
   alias: ssh youart-agent-base
-  private key path: /home/jacob/.ssh/ai-sandbox/youart-agent-base_ed25519
-  known hosts: /home/jacob/.ssh/ai-sandbox/known_hosts
+  private key path: /home/jacob/.ai-sandbox/ssh/youart-agent-base_ed25519
+  known hosts: /home/jacob/.ai-sandbox/ssh/known_hosts
   host key alias: ai-sandbox-youart-agent-base
   local: ssh youart-agent-base (127.0.0.1:2230)
-  tailscale0: ssh -i /home/jacob/.ssh/ai-sandbox/youart-agent-base_ed25519 -p 2230 agent@100.106.166.101
+  tailscale0: ssh -i /home/jacob/.ai-sandbox/ssh/youart-agent-base_ed25519 -p 2230 agent@100.106.166.101
 
 noVNC:
   local: http://127.0.0.1:2231/
@@ -141,7 +226,7 @@ Logs live under:
 Each box gets a unique Spark-side SSH key:
 
 ```bash
-~/.ssh/ai-sandbox/NAME_ed25519
+~/.ai-sandbox/ssh/NAME_ed25519
 ```
 
 Only that key's public half is installed into that VM. The managed SSH config block uses `IdentityFile` and `IdentitiesOnly yes`, so access to one box does not imply access to every box.
@@ -149,12 +234,24 @@ Only that key's public half is installed into that VM. The managed SSH config bl
 Managed host keys also stay in the sandbox SSH directory:
 
 ```bash
-~/.ssh/ai-sandbox/known_hosts
+~/.ai-sandbox/ssh/known_hosts
 ```
 
 Each box uses `HostKeyAlias ai-sandbox-NAME`, so reused localhost ports do not collide with stale global `~/.ssh/known_hosts` entries.
 
-The managed block in `~/.ssh/config` looks like:
+The managed blocks live in:
+
+```bash
+~/.ai-sandbox/ssh/config
+```
+
+`~/.ssh/config` only needs this include:
+
+```sshconfig
+Include ~/.ai-sandbox/ssh/config
+```
+
+Each managed block looks like:
 
 ```sshconfig
 # >>> ai-sandbox NAME
@@ -162,15 +259,17 @@ Host NAME
   HostName 127.0.0.1
   User agent
   Port 2230
-  IdentityFile ~/.ssh/ai-sandbox/NAME_ed25519
+  IdentityFile ~/.ai-sandbox/ssh/NAME_ed25519
   IdentitiesOnly yes
-  UserKnownHostsFile ~/.ssh/ai-sandbox/known_hosts
+  UserKnownHostsFile ~/.ai-sandbox/ssh/known_hosts
   HostKeyAlias ai-sandbox-NAME
   StrictHostKeyChecking accept-new
 # <<< ai-sandbox NAME
 ```
 
-Update replaces only the matching managed block. Destroy removes the matching block, the box-specific key, and the matching `ai-sandbox-NAME` known-hosts entry.
+Update replaces only the matching managed block. Destroy removes the matching
+block, the box-specific key, and the matching `ai-sandbox-NAME` known-hosts
+entry.
 
 ## Update
 
@@ -180,7 +279,8 @@ Update is a repair operation:
 sandbox update NAME
 ```
 
-It starts the VM if needed, reads `box.env`, regenerates LXD proxy devices and SSH config, syncs this checkout into the VM, runs:
+It starts the VM if needed, reads `box.env`, regenerates LXD proxy devices and
+SSH config, syncs this checkout and the host Codex profile into the VM, runs:
 
 ```bash
 ./uninstall-managed.sh
@@ -189,17 +289,28 @@ It starts the VM if needed, reads `box.env`, regenerates LXD proxy devices and S
 
 Then it runs doctor.
 
+Update also removes stale legacy managed-tooling shadows when they would win on
+`PATH`. For example, older boxes had `/usr/local/bin/codex` pointing at an old
+Codex install while the current managed npm prefix is `/usr`; `install.sh`
+removes that stale copy before reinstalling Codex.
+
 If the recorded port block is no longer available after old managed proxy devices are removed, update warns and moves the box to the next free contiguous block. The final `box.env` and SSH config are rewritten to match.
 
-Update preserves:
+Update preserves durable user state:
 
 - Chromium profile and OAuth state
-- Codex auth/config
+- Codex auth/config/global `AGENTS.md`
 - user SSH state
 - `git-repos`
 - `workspace`
 - `box.env`
 - logs
+
+Codex behavior rules that must load in every new agent belong in the host
+`~/.codex/AGENTS.md`. `sandbox create` and `sandbox update` copy that file into
+the VM Codex home. Do not use `~/.codex/memories/*.md` as the primary control
+surface for required behavior; Codex treats memories as generated recall state,
+and the memory feature may be disabled.
 
 ## Package Security
 
@@ -269,6 +380,9 @@ sandbox list sandbox-smoke
 sandbox view sandbox-smoke
 sandbox list
 sandbox ssh sandbox-smoke -- hostname
+sandbox stop sandbox-smoke
+sandbox list sandbox-smoke
+sandbox start sandbox-smoke
 sandbox doctor sandbox-smoke
 sandbox update sandbox-smoke
 ```
@@ -305,6 +419,33 @@ Destroy only throwaway boxes, and verify exact-name confirmation:
 
 ```bash
 printf 'sandbox-smoke\n' | sandbox destroy sandbox-smoke
+```
+
+Required clone/export smoke on throwaway boxes:
+
+```bash
+sandbox stop sandbox-smoke
+sandbox copy sandbox-smoke sandbox-copy
+sandbox ssh sandbox-copy -- hostname
+sandbox doctor sandbox-copy
+sandbox stop sandbox-copy
+sandbox export sandbox-copy
+sandbox create sandbox-import --from sandbox-copy
+sandbox ssh sandbox-import -- hostname
+sandbox doctor sandbox-import
+printf 'sandbox-copy\n' | sandbox destroy sandbox-copy
+printf 'sandbox-import\n' | sandbox destroy sandbox-import
+```
+
+After this smoke, verify managed host state lives under `~/.ai-sandbox`:
+
+```bash
+test -d ~/.ai-sandbox/ssh
+test -d ~/.ai-sandbox/boxes
+test -f ~/.ai-sandbox/ssh/config
+test -f ~/.ai-sandbox/ssh/known_hosts
+test ! -d ~/.ssh/ai-sandbox
+grep -q "$HOME/.ai-sandbox/ssh/config" ~/.ssh/config
 ```
 
 After the throwaway path passes, test update on the persistent known-good box:

@@ -67,7 +67,7 @@ sync_host_profile() {
   fi
 
   local items=()
-  for rel in config.toml hooks.json rules memories skills hooks; do
+  for rel in config.toml AGENTS.md AGENTS.override.md hooks.json rules memories skills hooks; do
     if [ -e "${CODEX_HOME_SOURCE}/${rel}" ]; then
       items+=("${rel}")
     fi
