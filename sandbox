@@ -972,8 +972,12 @@ doctor() {
     fi
   }
   retry_doctor() {
+    # 90s window: right after create/update the desktop services have just
+    # been (re)started, and a cold vncserver+XFCE start can exceed 30s. The
+    # host proxy ports accept instantly, so the HTTP checks are the real
+    # "service is up" gate and need the headroom.
     local attempt
-    for attempt in $(seq 1 30); do
+    for attempt in $(seq 1 90); do
       if "$@"; then
         return 0
       fi

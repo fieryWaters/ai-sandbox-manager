@@ -31,6 +31,23 @@ rm -f \
 
 systemctl daemon-reload
 
+log "Killing stale managed desktop processes"
+# Stopping the units is not enough: boxes that predate the current unit names
+# can have desktop processes leaked from old units (or from a boot under
+# since-deleted units) still squatting on 5901/6901/8000, which makes the new
+# services crash-loop with "Address already in use".
+pkill -TERM -f '/usr/local/bin/youart-start-' 2>/dev/null || true
+pkill -TERM -f '/usr/local/bin/sandbox-(vnc|novnc|cua-server)' 2>/dev/null || true
+pkill -TERM -f 'novnc_proxy' 2>/dev/null || true
+pkill -TERM -f 'websockify' 2>/dev/null || true
+pkill -TERM -f 'computer_server' 2>/dev/null || true
+pkill -TERM -f 'Xtigervnc :1' 2>/dev/null || true
+pkill -TERM -f 'vncserver :1' 2>/dev/null || true
+sleep 2
+pkill -KILL -f 'websockify' 2>/dev/null || true
+pkill -KILL -f 'computer_server' 2>/dev/null || true
+pkill -KILL -f 'Xtigervnc :1' 2>/dev/null || true
+
 log "Removing managed noVNC and computer-server installs"
 rm -rf /opt/noVNC /opt/cua-computer-server
 
