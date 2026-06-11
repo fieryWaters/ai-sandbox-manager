@@ -43,12 +43,13 @@ usage() {
 Usage:
   sandbox create NAME [--port-base N] [--user USER] [--bind ADDR]
                          [--ssh-bind ADDR] [--novnc-bind ADDR] [--cua-bind ADDR]
-                         [--public] [--from ARCHIVE_OR_NAME]
+                         [--public] [--github] [--from ARCHIVE_OR_NAME]
   sandbox update NAME
   sandbox start NAME
   sandbox stop NAME
   sandbox copy SOURCE DEST [--port-base N] [--bind ADDR]
   sandbox export NAME [FILE]
+  sandbox github NAME [--revoke]
   sandbox doctor NAME
   sandbox view NAME
   sandbox ssh NAME [-- COMMAND...]
@@ -106,6 +107,7 @@ Options:
   --novnc-bind ADDR   Bind only noVNC host proxy.
   --cua-bind ADDR     Bind only CUA fallback host proxy.
   --public            Bind all services to 0.0.0.0.
+  --github            Grant GitHub SSH push access after install.
   --from SOURCE       Import from SOURCE tarball or default archive name.
 EOF
       ;;
@@ -164,14 +166,28 @@ Exports a stopped sandbox with lxc export. Without FILE, writes:
 The box must be stopped first so the archive is consistent.
 EOF
       ;;
+    github)
+      cat <<'EOF'
+sandbox github NAME [--revoke]
+
+Grants a box GitHub SSH push access without placing GitHub tokens in the box.
+The box owns its ~/.ssh/id_ed25519 keypair; the host gh CLI registers the
+public key on the GitHub account, seeds github.com known_hosts in the box, and
+sets the box git identity.
+
+Options:
+  --revoke           Delete the recorded GitHub account key and clear state.
+EOF
+      ;;
     doctor)
       cat <<'EOF'
 sandbox doctor NAME
 
 Checks LXD, ports, ssh NAME, noVNC, computer-server /status, Codex login,
-Claude auth, the deskbot command surface, real deskbot screenshot pixels, a
-Codex-mediated deskbot browser smoke whose trace must show the canonical
-deskbot path, and a Claude-mediated deskbot browser smoke.
+Claude auth, GitHub SSH access when granted, the deskbot command surface, real
+deskbot screenshot pixels, a Codex-mediated deskbot browser smoke whose trace
+must show the canonical deskbot path, and a Claude-mediated deskbot browser
+smoke.
 EOF
       ;;
     view)
@@ -206,9 +222,10 @@ EOF
       cat <<'EOF'
 sandbox destroy NAME
 
-Deletes the LXD instance, removes only the matching managed SSH config block,
-removes that box's unique SSH keypair from ~/.ai-sandbox/ssh, and removes
-that box's managed known-hosts entry.
+Revokes the recorded GitHub account key when granted, deletes the LXD instance,
+removes only the matching managed SSH config block, removes that box's unique
+SSH keypair from ~/.ai-sandbox/ssh, and removes that box's managed known-hosts
+entry.
 
 Destroy requires typing the exact box name at the confirmation prompt.
 EOF
@@ -243,6 +260,10 @@ remove_managed_ssh_block_from_file() {
   ' "$file" >"$tmp"
   cat "$tmp" >"$file"
   rm -f "$tmp"
+}
+
+shell_quote() {
+  printf '%q' "$1"
 }
 
 ensure_ssh_include() {
@@ -476,6 +497,9 @@ load_box_env() {
   NOVNC_BIND=""
   CUA_BIND=""
   VNC_PASSWORD=""
+  GITHUB_SSH_KEY_TITLE=""
+  GITHUB_SSH_KEY_FINGERPRINT=""
+  GITHUB_SSH_KEY_ID=""
   local line key value
   while IFS= read -r line; do
     case "$line" in
@@ -484,7 +508,7 @@ load_box_env() {
         key="${line%%=*}"
         value="${line#*=}"
         case "$key" in
-          SANDBOX_USER|PORT_BASE|SSH_BIND|NOVNC_BIND|CUA_BIND|VNC_PASSWORD)
+          SANDBOX_USER|PORT_BASE|SSH_BIND|NOVNC_BIND|CUA_BIND|VNC_PASSWORD|GITHUB_SSH_KEY_TITLE|GITHUB_SSH_KEY_FINGERPRINT|GITHUB_SSH_KEY_ID)
             printf -v "$key" '%s' "$value"
             ;;
         esac
@@ -641,7 +665,8 @@ write_host_box_env() {
   ensure_state_dirs
   local path
   path="$(host_box_env_path "$name")"
-  cat >"$path" <<EOF
+  {
+    cat <<EOF
 SANDBOX_USER=${user}
 PORT_BASE=${port_base}
 VNC_PASSWORD=${vnc_password}
@@ -649,6 +674,14 @@ SSH_BIND=${ssh_bind}
 NOVNC_BIND=${novnc_bind}
 CUA_BIND=${cua_bind}
 EOF
+    if [ -n "${GITHUB_SSH_KEY_TITLE:-}" ] && [ -n "${GITHUB_SSH_KEY_FINGERPRINT:-}" ]; then
+      printf 'GITHUB_SSH_KEY_TITLE=%s\n' "$GITHUB_SSH_KEY_TITLE"
+      printf 'GITHUB_SSH_KEY_FINGERPRINT=%s\n' "$GITHUB_SSH_KEY_FINGERPRINT"
+      if [ -n "${GITHUB_SSH_KEY_ID:-}" ]; then
+        printf 'GITHUB_SSH_KEY_ID=%s\n' "$GITHUB_SSH_KEY_ID"
+      fi
+    fi
+  } >"$path"
   chmod 600 "$path"
 }
 
@@ -811,6 +844,210 @@ ensure_box_ssh_key() {
     chmod 600 '/home/$user/.ssh/authorized_keys'
     rm -f /tmp/ai-sandbox-authorized-key.pub
   "
+}
+
+github_state_granted() {
+  [ -n "${GITHUB_SSH_KEY_FINGERPRINT:-}" ]
+}
+
+github_key_title_for_box() {
+  printf 'sandbox-%s' "$1"
+}
+
+require_github_auth() {
+  require_cmd gh
+  if ! gh auth status >/dev/null 2>&1; then
+    die "GitHub CLI is not authenticated on the host; run: gh auth login"
+  fi
+}
+
+ssh_key_fingerprint_from_file() {
+  ssh-keygen -lf "$1" -E sha256 | awk '{ print $2 }'
+}
+
+ensure_box_github_key() {
+  local name="$1"
+  local user="$2"
+  lxc exec "$name" -- runuser -u "$user" -- bash -lc "
+    set -euo pipefail
+    install -d -m 700 \"\$HOME/.ssh\"
+    if [ ! -f \"\$HOME/.ssh/id_ed25519\" ]; then
+      rm -f \"\$HOME/.ssh/id_ed25519.pub\"
+      ssh-keygen -q -t ed25519 -N '' -C '${name} sandbox github' -f \"\$HOME/.ssh/id_ed25519\"
+    fi
+    if [ ! -f \"\$HOME/.ssh/id_ed25519.pub\" ]; then
+      ssh-keygen -y -f \"\$HOME/.ssh/id_ed25519\" > \"\$HOME/.ssh/id_ed25519.pub\"
+    fi
+    chmod 700 \"\$HOME/.ssh\"
+    chmod 600 \"\$HOME/.ssh/id_ed25519\"
+    chmod 644 \"\$HOME/.ssh/id_ed25519.pub\"
+  "
+}
+
+box_github_public_key_to_file() {
+  local name="$1"
+  local user="$2"
+  local target="$3"
+  lxc exec "$name" -- runuser -u "$user" -- bash -lc 'cat "$HOME/.ssh/id_ed25519.pub"' >"$target"
+}
+
+github_find_key_by_fingerprint() {
+  local wanted="$1"
+  FOUND_GITHUB_SSH_KEY_TITLE=""
+  FOUND_GITHUB_SSH_KEY_ID=""
+  local list_tmp err_tmp key_tmp
+  list_tmp="$(mktemp)"
+  err_tmp="$(mktemp)"
+  key_tmp="$(mktemp)"
+  if ! gh ssh-key list >"$list_tmp" 2>"$err_tmp"; then
+    local err
+    err="$(tr '\n' ' ' <"$err_tmp")"
+    rm -f "$list_tmp" "$err_tmp" "$key_tmp"
+    die "Could not list GitHub SSH keys: ${err}"
+  fi
+
+  local title key created id kind fp found=1
+  while IFS=$'\t' read -r title key created id kind; do
+    [ -n "${key:-}" ] || continue
+    printf '%s\n' "$key" >"$key_tmp"
+    if fp="$(ssh_key_fingerprint_from_file "$key_tmp" 2>/dev/null)" && [ "$fp" = "$wanted" ]; then
+      FOUND_GITHUB_SSH_KEY_TITLE="$title"
+      FOUND_GITHUB_SSH_KEY_ID="$id"
+      found=0
+      break
+    fi
+  done <"$list_tmp"
+
+  rm -f "$list_tmp" "$err_tmp" "$key_tmp"
+  return "$found"
+}
+
+host_git_email() {
+  local email=""
+  if command -v git >/dev/null 2>&1; then
+    email="$(git config user.email 2>/dev/null || true)"
+  fi
+  printf '%s' "${email:-fierywaters13@gmail.com}"
+}
+
+seed_box_github_known_hosts() {
+  local name="$1"
+  local user="$2"
+  lxc exec "$name" -- runuser -u "$user" -- bash -lc '
+    set -euo pipefail
+    install -d -m 700 "$HOME/.ssh"
+    touch "$HOME/.ssh/known_hosts"
+    ssh-keygen -R github.com -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
+    rm -f "$HOME/.ssh/known_hosts.old"
+    timeout 30 ssh-keyscan -t rsa,ecdsa,ed25519 github.com >>"$HOME/.ssh/known_hosts" 2>/dev/null
+    chmod 600 "$HOME/.ssh/known_hosts"
+  '
+}
+
+set_box_git_identity() {
+  local name="$1"
+  local user="$2"
+  local git_name="${name} sandbox"
+  local git_email
+  git_email="$(host_git_email)"
+  local quoted_name quoted_email
+  quoted_name="$(shell_quote "$git_name")"
+  quoted_email="$(shell_quote "$git_email")"
+  lxc exec "$name" -- runuser -u "$user" -- bash -lc "
+    set -euo pipefail
+    git config --global user.name $quoted_name
+    git config --global user.email $quoted_email
+  "
+}
+
+record_github_state() {
+  local name="$1"
+  local title="$2"
+  local fingerprint="$3"
+  local key_id="${4:-}"
+  load_box_env "$name" || die "No box.env found; run update first"
+  GITHUB_SSH_KEY_TITLE="$title"
+  GITHUB_SSH_KEY_FINGERPRINT="$fingerprint"
+  GITHUB_SSH_KEY_ID="$key_id"
+  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+}
+
+clear_github_state() {
+  local name="$1"
+  load_box_env "$name" || die "No box.env found; run update first"
+  GITHUB_SSH_KEY_TITLE=""
+  GITHUB_SSH_KEY_FINGERPRINT=""
+  GITHUB_SSH_KEY_ID=""
+  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+}
+
+github_grant() {
+  local name="$1"
+  require_cmd lxc
+  require_cmd ssh-keygen
+  require_github_auth
+  instance_exists "$name" || die "LXD instance not found: ${name}"
+  start_instance "$name"
+  wait_for_lxc "$name"
+  load_box_env "$name" || die "No box.env found; run update first"
+
+  ensure_box_github_key "$name" "$SANDBOX_USER"
+
+  local public_key_file
+  public_key_file="$(mktemp)"
+  box_github_public_key_to_file "$name" "$SANDBOX_USER" "$public_key_file"
+  local fingerprint title key_id
+  fingerprint="$(ssh_key_fingerprint_from_file "$public_key_file")"
+
+  if github_find_key_by_fingerprint "$fingerprint"; then
+    title="$FOUND_GITHUB_SSH_KEY_TITLE"
+    key_id="$FOUND_GITHUB_SSH_KEY_ID"
+    log "GitHub SSH key ${fingerprint} is already registered as ${title}; skipping add"
+  else
+    title="$(github_key_title_for_box "$name")"
+    log "Adding GitHub SSH key ${fingerprint} as ${title}"
+    gh ssh-key add "$public_key_file" --title "$title" >/dev/null
+    key_id=""
+    if github_find_key_by_fingerprint "$fingerprint"; then
+      title="${FOUND_GITHUB_SSH_KEY_TITLE:-$title}"
+      key_id="$FOUND_GITHUB_SSH_KEY_ID"
+    fi
+  fi
+
+  seed_box_github_known_hosts "$name" "$SANDBOX_USER"
+  set_box_git_identity "$name" "$SANDBOX_USER"
+  record_github_state "$name" "$title" "$fingerprint" "$key_id"
+  rm -f "$public_key_file"
+  log "GitHub access granted for ${name}"
+}
+
+github_revoke() {
+  local name="$1"
+  require_cmd ssh-keygen
+  require_github_auth
+  if ! load_box_env "$name"; then
+    warn "No host box state found for ${name}; nothing to revoke"
+    return
+  fi
+  if ! github_state_granted; then
+    warn "No GitHub SSH key recorded for ${name}; nothing to revoke"
+    return
+  fi
+
+  local fingerprint="$GITHUB_SSH_KEY_FINGERPRINT"
+  local title="$GITHUB_SSH_KEY_TITLE"
+  if github_find_key_by_fingerprint "$fingerprint"; then
+    if [ -z "$FOUND_GITHUB_SSH_KEY_ID" ]; then
+      die "Could not determine GitHub SSH key id for ${fingerprint}"
+    fi
+    log "Revoking GitHub SSH key ${fingerprint} (${title})"
+    gh ssh-key delete "$FOUND_GITHUB_SSH_KEY_ID" --yes >/dev/null
+  else
+    warn "GitHub SSH key ${fingerprint} (${title}) is already gone"
+  fi
+
+  clear_github_state "$name"
+  log "GitHub access revoked for ${name}"
 }
 
 sync_host_codex_profile() {
@@ -992,6 +1229,24 @@ doctor() {
   check_doctor "CUA port ${CUA_PORT}" retry_doctor tcp_check "$CUA_PORT"
   check_doctor "ssh ${name}" ssh -o BatchMode=yes "$name" hostname
   check_doctor "VM hostname" ssh_hostname_matches "$name"
+  if github_state_granted; then
+    printf '[doctor] %-32s granted (%s)\n' "GitHub access" "$GITHUB_SSH_KEY_FINGERPRINT"
+    check_doctor "GitHub SSH auth" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
+      set -euo pipefail
+      status=0
+      out="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1)" || status=$?
+      if [ "$status" -ne 1 ]; then
+        printf "%s\n" "$out" >&2
+        exit 1
+      fi
+      if ! printf "%s\n" "$out" | grep -qi "successfully authenticated"; then
+        printf "%s\n" "$out" >&2
+        exit 1
+      fi
+    '
+  else
+    printf '[doctor] %-32s not granted\n' "GitHub access"
+  fi
   check_doctor "noVNC HTTP" retry_doctor curl -fsS "http://127.0.0.1:${NOVNC_PORT}/"
   check_doctor "CUA status" retry_doctor curl -fsS "http://127.0.0.1:${CUA_PORT}/status"
   # Doctor's validation scripts run from the checkout that sync_repo_to_vm
@@ -1148,6 +1403,7 @@ cmd_create() {
   local novnc_bind="$DEFAULT_BIND"
   local cua_bind="$DEFAULT_BIND"
   local from_source=""
+  local grant_github="no"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --port-base) port_base="${2:-}"; shift 2 ;;
@@ -1157,6 +1413,7 @@ cmd_create() {
       --novnc-bind) novnc_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
       --cua-bind) cua_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
       --public) ssh_bind="0.0.0.0"; novnc_bind="0.0.0.0"; cua_bind="0.0.0.0"; shift ;;
+      --github) grant_github="yes"; shift ;;
       --from) from_source="${2:-}"; shift 2 ;;
       -h|--help) command_help create; exit 0 ;;
       --*) die "Unknown create option: $1" ;;
@@ -1180,6 +1437,9 @@ cmd_create() {
     log "Importing ${name} from ${archive}"
     lxc import "$archive" "$name"
     finalize_cloned_box "$name" "$port_base" "$ssh_bind" "$novnc_bind" "$cua_bind"
+    if [ "$grant_github" = "yes" ]; then
+      github_grant "$name"
+    fi
     cmd_doctor "$name"
     log "Created ${name}"
     printf 'SSH:   ssh %s\n' "$name"
@@ -1212,6 +1472,9 @@ cmd_create() {
   sync_host_claude_profile "$name" "$user"
   run_install "$name" "$user" no
   write_ssh_config "$name" "$user" "$SSH_PORT"
+  if [ "$grant_github" = "yes" ]; then
+    github_grant "$name"
+  fi
   cmd_doctor "$name"
   log "Created ${name}"
   printf 'SSH:   ssh %s\n' "$name"
@@ -1334,6 +1597,26 @@ cmd_export() {
   mv -f "$tmp" "$target"
   chmod 600 "$target"
   ls -lh "$target"
+}
+
+cmd_github() {
+  local name=""
+  local revoke="no"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --revoke) revoke="yes"; shift ;;
+      -h|--help) command_help github; exit 0 ;;
+      --*) die "Unknown github option: $1" ;;
+      *) [ -z "$name" ] || die "Unexpected argument: $1"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "Missing NAME"
+  validate_name "$name"
+  if [ "$revoke" = "yes" ]; then
+    github_revoke "$name"
+  else
+    github_grant "$name"
+  fi
 }
 
 cmd_doctor() {
@@ -1571,11 +1854,17 @@ cmd_destroy() {
   [ -n "$name" ] || die "Missing NAME"
   validate_name "$name"
   instance_exists "$name" || die "LXD instance not found: ${name}"
-  printf 'This will permanently delete LXD instance %s and remove its managed SSH config, known-host entry, and keypair.\n' "$name" >&2
+  printf 'This will permanently delete LXD instance %s, revoke its recorded GitHub key if granted, and remove its managed SSH config, known-host entry, and keypair.\n' "$name" >&2
   printf 'Type the exact box name to continue: ' >&2
   local answer
   read -r answer
   [ "$answer" = "$name" ] || die "Confirmation did not match; aborting"
+  GITHUB_SSH_KEY_TITLE=""
+  GITHUB_SSH_KEY_FINGERPRINT=""
+  GITHUB_SSH_KEY_ID=""
+  if load_box_env "$name" >/dev/null 2>&1 && github_state_granted; then
+    github_revoke "$name"
+  fi
   log "Removing managed SSH config block for ${name}"
   remove_managed_ssh_block "$name"
   log "Removing managed SSH known-host entry for ${name}"
@@ -1603,6 +1892,7 @@ main() {
     stop) cmd_stop "$@" ;;
     copy|cp) cmd_copy "$@" ;;
     export) cmd_export "$@" ;;
+    github) cmd_github "$@" ;;
     doctor) cmd_doctor "$@" ;;
     view) cmd_view "$@" ;;
     ssh) cmd_ssh "$@" ;;
