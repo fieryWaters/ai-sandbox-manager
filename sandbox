@@ -23,6 +23,8 @@ DEFAULT_IMAGE="ubuntu:24.04"
 DEFAULT_USER="agent"
 DEFAULT_PORT_BASE="2230"
 DEFAULT_BIND="127.0.0.1"
+DEFAULT_MEMORY_LIMIT="100GiB"
+LXC_QUERY_TIMEOUT_SECONDS="10"
 CONFIG_REL=".ai-sandbox/box.env"
 REPO_REL=".ai-sandbox/ai-sandbox-manager"
 STATE_DIR="${HOME}/.ai-sandbox"
@@ -34,6 +36,8 @@ SSH_CONFIG="${HOME}/.ssh/config"
 SSH_KEY_DIR="$SSH_DIR"
 SSH_KNOWN_HOSTS="${SSH_DIR}/known_hosts"
 
+exec 9>&2
+
 log() { printf '[sandbox] %s\n' "$*"; }
 warn() { printf '[sandbox][warn] %s\n' "$*" >&2; }
 die() { printf '[sandbox][error] %s\n' "$*" >&2; exit 1; }
@@ -43,7 +47,8 @@ usage() {
 Usage:
   sandbox create NAME [--port-base N] [--user USER] [--bind ADDR]
                          [--ssh-bind ADDR] [--novnc-bind ADDR] [--cua-bind ADDR]
-                         [--public] [--github] [--from ARCHIVE_OR_NAME]
+                         [--memory LIMIT] [--public] [--github]
+                         [--from ARCHIVE_OR_NAME]
   sandbox update NAME
   sandbox start NAME
   sandbox stop NAME
@@ -61,6 +66,7 @@ Core defaults:
   --user agent
   --port-base first free block from 2230
   --bind 127.0.0.1
+  --memory 100GiB
 
 Ports are always contiguous:
   SSH          PORT_BASE
@@ -106,6 +112,8 @@ Options:
   --ssh-bind ADDR     Bind only SSH host proxy.
   --novnc-bind ADDR   Bind only noVNC host proxy.
   --cua-bind ADDR     Bind only CUA fallback host proxy.
+  --memory LIMIT      Set LXD limits.memory after launch. Default: 100GiB.
+                      Use --memory none to leave the box uncapped.
   --public            Bind all services to 0.0.0.0.
   --github            Grant GitHub SSH push access after install.
   --from SOURCE       Import from SOURCE tarball or default archive name.
@@ -214,8 +222,8 @@ sandbox list [NAME]
 Without NAME, prints a compact overview of current LXD instances.
 
 With NAME, prints the detailed access view for one box: user, private key path,
-known-host alias, SSH commands, noVNC URLs, CUA URLs, ports, and bind addresses.
-It does not print private key contents.
+known-host alias, SSH commands, noVNC URLs, CUA URLs, ports, bind addresses,
+and memory limit. It does not print private key contents.
 EOF
       ;;
     destroy)
@@ -238,6 +246,42 @@ EOF
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+lxc_query_timeout_error() {
+  printf '[sandbox][error] LXD daemon unresponsive (timed out after %ss) -- host may be under memory pressure\n' "$LXC_QUERY_TIMEOUT_SECONDS" >&9
+  exit 1
+}
+
+_lxc_query() {
+  local quiet="$1"
+  shift
+  require_cmd timeout
+  local err status
+  err="$(mktemp)"
+  if timeout "$LXC_QUERY_TIMEOUT_SECONDS" lxc "$@" 2>"$err"; then
+    rm -f "$err"
+    return 0
+  else
+    status="$?"
+  fi
+  if [ "$status" -eq 124 ]; then
+    rm -f "$err"
+    lxc_query_timeout_error
+  fi
+  if [ "$quiet" != "yes" ]; then
+    cat "$err" >&2
+  fi
+  rm -f "$err"
+  return "$status"
+}
+
+lxc_query() {
+  _lxc_query no "$@"
+}
+
+lxc_query_quiet() {
+  _lxc_query yes "$@"
 }
 
 ensure_state_dirs() {
@@ -315,6 +359,33 @@ normalize_bind() {
   esac
 }
 
+validate_memory_limit() {
+  local limit="$1"
+  [ -n "$limit" ] || die "Memory limit must not be empty; use --memory none to skip the cap"
+  [ "$limit" = "none" ] && return
+  [[ "$limit" =~ ^[A-Za-z0-9._%+-]+$ ]] || die "Memory limit contains unsupported characters: ${limit}"
+}
+
+memory_limit_display() {
+  local recorded="$1"
+  local actual="$2"
+  if [ -n "$recorded" ]; then
+    if [ "$recorded" = "none" ]; then
+      if [ -n "$actual" ]; then
+        printf 'none (actual: %s)' "$actual"
+      else
+        printf 'none'
+      fi
+    elif [ -n "$actual" ] && [ "$actual" != "$recorded" ]; then
+      printf '%s (actual: %s)' "$recorded" "$actual"
+    else
+      printf '%s' "$recorded"
+    fi
+  else
+    printf 'unrecorded (actual: %s)' "${actual:-none}"
+  fi
+}
+
 ports_from_base() {
   PORT_BASE="$1"
   SSH_PORT="$PORT_BASE"
@@ -330,20 +401,24 @@ port_listening() {
 configured_proxy_port_owner() {
   local port="$1"
   local exclude="${2:-}"
-  local name device listen listen_port
+  local rows name device listen_port
+  rows="$(mktemp)"
+  lxc_query list --format csv -c ns >"$rows"
   while IFS=, read -r name _status; do
     [ -n "$name" ] || continue
     [ "$name" = "$exclude" ] && continue
     for device in ai-sandbox-ssh ai-sandbox-novnc ai-sandbox-cua; do
-      listen="$(device_listen "$name" "$device")"
-      [ -n "$listen" ] || continue
-      listen_port="$(parse_listen_port "$listen")"
+      load_device_listen "$name" "$device"
+      [ -n "$DEVICE_LISTEN" ] || continue
+      listen_port="$(parse_listen_port "$DEVICE_LISTEN")"
       if [ "$listen_port" = "$port" ]; then
         printf '%s' "$name"
+        rm -f "$rows"
         return
       fi
     done
-  done < <(lxc list --format csv -c ns 2>/dev/null)
+  done <"$rows"
+  rm -f "$rows"
 }
 
 busy_port_in_block() {
@@ -406,16 +481,32 @@ generate_password() {
 }
 
 instance_exists() {
-  lxc info "$1" >/dev/null 2>&1
+  lxc_query_quiet info "$1" >/dev/null
+}
+
+load_instance_status() {
+  local name="$1"
+  local tmp
+  tmp="$(mktemp)"
+  if ! lxc_query_quiet info "$name" >"$tmp"; then
+    rm -f "$tmp"
+    INSTANCE_STATUS=""
+    return 1
+  fi
+  INSTANCE_STATUS="$(awk -F: '/^Status:/ { gsub(/^ +/, "", $2); status=$2 } END { print status }' "$tmp")"
+  rm -f "$tmp"
+  [ -n "$INSTANCE_STATUS" ]
 }
 
 instance_status() {
-  lxc info "$1" 2>/dev/null | awk -F: '/^Status:/ { gsub(/^ +/, "", $2); status=$2 } END { print status }'
+  load_instance_status "$1" || return 1
+  printf '%s\n' "$INSTANCE_STATUS"
 }
 
 start_instance() {
   local name="$1"
-  if [ "$(instance_status "$name")" = "STOPPED" ]; then
+  load_instance_status "$name" || return 1
+  if [ "$INSTANCE_STATUS" = "STOPPED" ]; then
     lxc start "$name"
   fi
 }
@@ -471,7 +562,8 @@ read_box_env() {
     cat "$host_env"
     return 0
   fi
-  [ "$(instance_status "$name")" != "STOPPED" ] || return 1
+  load_instance_status "$name" || return 1
+  [ "$INSTANCE_STATUS" != "STOPPED" ] || return 1
   lxc exec "$name" -- bash -lc '
     for path in /home/*/.ai-sandbox/box.env; do
       if [ -f "$path" ]; then
@@ -496,6 +588,7 @@ load_box_env() {
   SSH_BIND=""
   NOVNC_BIND=""
   CUA_BIND=""
+  MEMORY_LIMIT=""
   VNC_PASSWORD=""
   GITHUB_SSH_KEY_TITLE=""
   GITHUB_SSH_KEY_FINGERPRINT=""
@@ -508,7 +601,7 @@ load_box_env() {
         key="${line%%=*}"
         value="${line#*=}"
         case "$key" in
-          SANDBOX_USER|PORT_BASE|SSH_BIND|NOVNC_BIND|CUA_BIND|VNC_PASSWORD|GITHUB_SSH_KEY_TITLE|GITHUB_SSH_KEY_FINGERPRINT|GITHUB_SSH_KEY_ID)
+          SANDBOX_USER|PORT_BASE|SSH_BIND|NOVNC_BIND|CUA_BIND|MEMORY_LIMIT|VNC_PASSWORD|GITHUB_SSH_KEY_TITLE|GITHUB_SSH_KEY_FINGERPRINT|GITHUB_SSH_KEY_ID)
             printf -v "$key" '%s' "$value"
             ;;
         esac
@@ -526,17 +619,32 @@ load_box_env() {
   [ -n "$PORT_BASE" ] || return 1
   validate_user "$SANDBOX_USER"
   validate_port_base "$PORT_BASE"
+  if [ -n "$MEMORY_LIMIT" ]; then
+    validate_memory_limit "$MEMORY_LIMIT"
+  fi
   SSH_BIND="$(normalize_bind "$SSH_BIND")"
   NOVNC_BIND="$(normalize_bind "$NOVNC_BIND")"
   CUA_BIND="$(normalize_bind "$CUA_BIND")"
   ports_from_base "$PORT_BASE"
-  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" "$MEMORY_LIMIT"
+}
+
+load_device_listen() {
+  local name="$1"
+  local device="$2"
+  local tmp
+  tmp="$(mktemp)"
+  if lxc_query_quiet config device get "$name" "$device" listen >"$tmp"; then
+    DEVICE_LISTEN="$(cat "$tmp")"
+  else
+    DEVICE_LISTEN=""
+  fi
+  rm -f "$tmp"
 }
 
 device_listen() {
-  local name="$1"
-  local device="$2"
-  lxc config device get "$name" "$device" listen 2>/dev/null || true
+  load_device_listen "$1" "$2"
+  printf '%s\n' "$DEVICE_LISTEN"
 }
 
 parse_listen_port() {
@@ -603,11 +711,10 @@ effective_proxy() {
   local fallback_port="$4"
   EFFECTIVE_BIND="$fallback_bind"
   EFFECTIVE_PORT="$fallback_port"
-  local listen
-  listen="$(device_listen "$name" "$device")"
-  if [ -n "$listen" ]; then
-    EFFECTIVE_BIND="$(parse_listen_bind "$listen")"
-    EFFECTIVE_PORT="$(parse_listen_port "$listen")"
+  load_device_listen "$name" "$device"
+  if [ -n "$DEVICE_LISTEN" ]; then
+    EFFECTIVE_BIND="$(parse_listen_bind "$DEVICE_LISTEN")"
+    EFFECTIVE_PORT="$(parse_listen_port "$DEVICE_LISTEN")"
   fi
 }
 
@@ -632,6 +739,7 @@ write_box_env() {
   local ssh_bind="$5"
   local novnc_bind="$6"
   local cua_bind="$7"
+  local memory_limit="${8:-}"
   local path
   path="$(box_config_path "$user")"
   local content
@@ -644,6 +752,10 @@ NOVNC_BIND=${novnc_bind}
 CUA_BIND=${cua_bind}
 EOF
 )"
+  if [ -n "$memory_limit" ]; then
+    content="${content}
+MEMORY_LIMIT=${memory_limit}"
+  fi
   printf '%s\n' "$content" | lxc exec "$name" -- bash -lc "
     set -e
     install -d -m 700 -o '$user' -g '$user' '/home/$user/.ai-sandbox'
@@ -651,7 +763,7 @@ EOF
     chown '$user:$user' '$path'
     chmod 600 '$path'
   "
-  write_host_box_env "$name" "$user" "$port_base" "$vnc_password" "$ssh_bind" "$novnc_bind" "$cua_bind"
+  write_host_box_env "$name" "$user" "$port_base" "$vnc_password" "$ssh_bind" "$novnc_bind" "$cua_bind" "$memory_limit"
 }
 
 write_host_box_env() {
@@ -662,6 +774,7 @@ write_host_box_env() {
   local ssh_bind="$5"
   local novnc_bind="$6"
   local cua_bind="$7"
+  local memory_limit="${8:-}"
   ensure_state_dirs
   local path
   path="$(host_box_env_path "$name")"
@@ -674,6 +787,9 @@ SSH_BIND=${ssh_bind}
 NOVNC_BIND=${novnc_bind}
 CUA_BIND=${cua_bind}
 EOF
+    if [ -n "$memory_limit" ]; then
+      printf 'MEMORY_LIMIT=%s\n' "$memory_limit"
+    fi
     if [ -n "${GITHUB_SSH_KEY_TITLE:-}" ] && [ -n "${GITHUB_SSH_KEY_FINGERPRINT:-}" ]; then
       printf 'GITHUB_SSH_KEY_TITLE=%s\n' "$GITHUB_SSH_KEY_TITLE"
       printf 'GITHUB_SSH_KEY_FINGERPRINT=%s\n' "$GITHUB_SSH_KEY_FINGERPRINT"
@@ -688,7 +804,7 @@ EOF
 remove_device_if_present() {
   local name="$1"
   local device="$2"
-  if lxc config device get "$name" "$device" type >/dev/null 2>&1; then
+  if lxc_query_quiet config device get "$name" "$device" type >/dev/null; then
     lxc config device remove "$name" "$device" >/dev/null
   fi
 }
@@ -703,13 +819,51 @@ remove_proxy_devices() {
   remove_device_if_present "$name" host-cua
 }
 
+load_lxd_memory_limit() {
+  local name="$1"
+  local tmp
+  tmp="$(mktemp)"
+  if lxc_query_quiet config get "$name" limits.memory >"$tmp"; then
+    LXD_MEMORY_LIMIT="$(cat "$tmp")"
+  else
+    LXD_MEMORY_LIMIT=""
+  fi
+  rm -f "$tmp"
+}
+
+apply_memory_limit() {
+  local name="$1"
+  local memory_limit="$2"
+  [ -n "$memory_limit" ] || return
+  validate_memory_limit "$memory_limit"
+  if [ "$memory_limit" = "none" ]; then
+    log "Leaving ${name} without a memory cap"
+    lxc config unset "$name" limits.memory >/dev/null 2>&1 || true
+    return
+  fi
+  # A cap makes a runaway build OOM inside its own box instead of starving host RAM and LXD.
+  log "Setting ${name} memory cap to ${memory_limit}"
+  lxc config set "$name" limits.memory "$memory_limit"
+}
+
+memory_limit_matches() {
+  local name="$1"
+  local expected="$2"
+  load_lxd_memory_limit "$name"
+  if [ "$expected" = "none" ]; then
+    [ -z "$LXD_MEMORY_LIMIT" ]
+  else
+    [ "$LXD_MEMORY_LIMIT" = "$expected" ]
+  fi
+}
+
 configure_base_lxd() {
   local name="$1"
   lxc config set "$name" security.nesting true
   lxc config set "$name" security.syscalls.intercept.mknod true
   lxc config set "$name" security.syscalls.intercept.setxattr true
   lxc config set "$name" boot.autostart true
-  if ! lxc config device get "$name" ai-sandbox-gpu type >/dev/null 2>&1; then
+  if ! lxc_query_quiet config device get "$name" ai-sandbox-gpu type >/dev/null; then
     lxc config device add "$name" ai-sandbox-gpu gpu >/dev/null 2>&1 || warn "GPU device not added; doctor will report GPU capability separately"
   fi
 }
@@ -969,7 +1123,7 @@ record_github_state() {
   GITHUB_SSH_KEY_TITLE="$title"
   GITHUB_SSH_KEY_FINGERPRINT="$fingerprint"
   GITHUB_SSH_KEY_ID="$key_id"
-  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" "$MEMORY_LIMIT"
 }
 
 clear_github_state() {
@@ -978,7 +1132,7 @@ clear_github_state() {
   GITHUB_SSH_KEY_TITLE=""
   GITHUB_SSH_KEY_FINGERPRINT=""
   GITHUB_SSH_KEY_ID=""
-  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" "$MEMORY_LIMIT"
 }
 
 github_grant() {
@@ -1223,7 +1377,13 @@ doctor() {
     "$@"
   }
 
-  check_doctor "LXD instance" lxc info "$name"
+  check_doctor "LXD instance" lxc_query info "$name"
+  if [ -n "${MEMORY_LIMIT:-}" ]; then
+    check_doctor "Memory cap ${MEMORY_LIMIT}" memory_limit_matches "$name" "$MEMORY_LIMIT"
+  else
+    load_lxd_memory_limit "$name"
+    printf '[doctor] %-32s unrecorded (actual: %s)\n' "Memory cap" "${LXD_MEMORY_LIMIT:-none}"
+  fi
   check_doctor "SSH port ${SSH_PORT}" retry_doctor tcp_check "$SSH_PORT"
   check_doctor "noVNC port ${NOVNC_PORT}" retry_doctor tcp_check "$NOVNC_PORT"
   check_doctor "CUA port ${CUA_PORT}" retry_doctor tcp_check "$CUA_PORT"
@@ -1308,9 +1468,8 @@ doctor() {
 
 require_stopped_instance() {
   local name="$1"
-  local status
-  status="$(instance_status "$name")"
-  [ "$status" = "STOPPED" ] || die "${name} must be stopped first; run: sandbox stop ${name}"
+  load_instance_status "$name" || die "Could not read LXD status for ${name}"
+  [ "$INSTANCE_STATUS" = "STOPPED" ] || die "${name} must be stopped first; run: sandbox stop ${name}"
 }
 
 archive_path_for_name() {
@@ -1363,6 +1522,7 @@ finalize_cloned_box() {
   local ssh_bind="$3"
   local novnc_bind="$4"
   local cua_bind="$5"
+  local memory_limit="${6:-}"
 
   validate_name "$name"
   validate_port_base "$port_base"
@@ -1377,6 +1537,12 @@ finalize_cloned_box() {
   set_vm_hostname "$name"
   load_box_env "$name" || die "${name} is not a managed sandbox archive/copy; missing box.env"
   ensure_user "$name" "$SANDBOX_USER"
+  if [ -n "$memory_limit" ]; then
+    MEMORY_LIMIT="$memory_limit"
+  elif [ -z "${MEMORY_LIMIT:-}" ]; then
+    load_lxd_memory_limit "$name"
+    MEMORY_LIMIT="$LXD_MEMORY_LIMIT"
+  fi
 
   PORT_BASE="$port_base"
   SSH_BIND="$ssh_bind"
@@ -1384,7 +1550,8 @@ finalize_cloned_box() {
   CUA_BIND="$cua_bind"
   ports_from_base "$PORT_BASE"
   VNC_PASSWORD="$(generate_password)"
-  write_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+  apply_memory_limit "$name" "$MEMORY_LIMIT"
+  write_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" "$MEMORY_LIMIT"
   refresh_vm_vnc_password "$name" "$SANDBOX_USER" "$VNC_PASSWORD"
   clear_vm_chromium_locks "$name" "$SANDBOX_USER"
   configure_proxy_devices "$name" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
@@ -1404,6 +1571,7 @@ cmd_create() {
   local cua_bind="$DEFAULT_BIND"
   local from_source=""
   local grant_github="no"
+  local memory_limit="$DEFAULT_MEMORY_LIMIT"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --port-base) port_base="${2:-}"; shift 2 ;;
@@ -1412,6 +1580,7 @@ cmd_create() {
       --ssh-bind) ssh_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
       --novnc-bind) novnc_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
       --cua-bind) cua_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
+      --memory) memory_limit="${2:-}"; validate_memory_limit "$memory_limit"; shift 2 ;;
       --public) ssh_bind="0.0.0.0"; novnc_bind="0.0.0.0"; cua_bind="0.0.0.0"; shift ;;
       --github) grant_github="yes"; shift ;;
       --from) from_source="${2:-}"; shift 2 ;;
@@ -1423,6 +1592,7 @@ cmd_create() {
   [ -n "$name" ] || die "Missing NAME"
   validate_name "$name"
   validate_user "$user"
+  validate_memory_limit "$memory_limit"
   if [ -n "$from_source" ]; then
     [ "$user_explicit" = "no" ] || die "--user is only supported for clean creates; imported boxes keep their archived user"
     instance_exists "$name" && die "LXD instance already exists: ${name}; use update"
@@ -1436,7 +1606,7 @@ cmd_create() {
     check_port_block_free "$port_base"
     log "Importing ${name} from ${archive}"
     lxc import "$archive" "$name"
-    finalize_cloned_box "$name" "$port_base" "$ssh_bind" "$novnc_bind" "$cua_bind"
+    finalize_cloned_box "$name" "$port_base" "$ssh_bind" "$novnc_bind" "$cua_bind" "$memory_limit"
     if [ "$grant_github" = "yes" ]; then
       github_grant "$name"
     fi
@@ -1457,6 +1627,7 @@ cmd_create() {
 
   log "Launching ${name} from ${DEFAULT_IMAGE}"
   lxc launch "$DEFAULT_IMAGE" "$name"
+  apply_memory_limit "$name" "$memory_limit"
   start_instance "$name"
   wait_for_lxc "$name"
   configure_base_lxd "$name"
@@ -1464,7 +1635,7 @@ cmd_create() {
   ensure_user "$name" "$user"
   local pw
   pw="$(generate_password)"
-  write_box_env "$name" "$user" "$port_base" "$pw" "$ssh_bind" "$novnc_bind" "$cua_bind"
+  write_box_env "$name" "$user" "$port_base" "$pw" "$ssh_bind" "$novnc_bind" "$cua_bind" "$memory_limit"
   configure_proxy_devices "$name" "$ssh_bind" "$novnc_bind" "$cua_bind"
   sync_repo_to_vm "$name" "$user"
   ensure_box_ssh_key "$name" "$user"
@@ -1494,8 +1665,9 @@ cmd_update() {
   load_box_env "$name" || die "No box.env found for ${name}; this box predates managed config"
   ensure_user "$name" "$SANDBOX_USER"
   configure_base_lxd "$name"
+  apply_memory_limit "$name" "$MEMORY_LIMIT"
   configure_proxy_devices "$name" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" yes
-  write_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+  write_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" "$MEMORY_LIMIT"
   sync_repo_to_vm "$name" "$SANDBOX_USER"
   ensure_box_ssh_key "$name" "$SANDBOX_USER"
   sync_host_codex_profile "$name" "$SANDBOX_USER"
@@ -1512,13 +1684,12 @@ cmd_start() {
   [ -n "$name" ] || die "Missing NAME"
   validate_name "$name"
   instance_exists "$name" || die "LXD instance not found: ${name}"
-  local status
-  status="$(instance_status "$name")"
-  if [ "$status" = "STOPPED" ]; then
+  load_instance_status "$name" || die "Could not read LXD status for ${name}"
+  if [ "$INSTANCE_STATUS" = "STOPPED" ]; then
     log "Starting ${name}"
     lxc start "$name"
   else
-    log "${name} is already ${status}"
+    log "${name} is already ${INSTANCE_STATUS}"
   fi
   wait_for_lxc "$name"
   load_box_env "$name" || die "No box.env found; run update first"
@@ -1541,9 +1712,8 @@ cmd_stop() {
   [ -n "$name" ] || die "Missing NAME"
   validate_name "$name"
   instance_exists "$name" || die "LXD instance not found: ${name}"
-  local status
-  status="$(instance_status "$name")"
-  if [ "$status" = "STOPPED" ]; then
+  load_instance_status "$name" || die "Could not read LXD status for ${name}"
+  if [ "$INSTANCE_STATUS" = "STOPPED" ]; then
     log "${name} is already STOPPED"
     return
   fi
@@ -1787,11 +1957,10 @@ print_list_detail() {
   local name="$1"
   validate_name "$name"
   instance_exists "$name" || die "LXD instance not found: ${name}"
-  local status
-  status="$(instance_status "$name")"
+  load_instance_status "$name" || die "Could not read LXD status for ${name}"
 
   printf 'name: %s\n' "$name"
-  printf 'status: %s\n' "$status"
+  printf 'status: %s\n' "$INSTANCE_STATUS"
   if ! load_box_env "$name" >/dev/null 2>&1; then
     printf 'managed: no\n'
     printf 'box.env: missing\n'
@@ -1807,6 +1976,9 @@ print_list_detail() {
   effective_proxy "$name" ai-sandbox-cua "$CUA_BIND" "$CUA_PORT"
   local cua_bind="$EFFECTIVE_BIND"
   local cua_port="$EFFECTIVE_PORT"
+  load_lxd_memory_limit "$name"
+  local memory_summary
+  memory_summary="$(memory_limit_display "$MEMORY_LIMIT" "$LXD_MEMORY_LIMIT")"
   local key_path="${SSH_KEY_DIR}/${name}_ed25519"
   local host_alias
   host_alias="$(managed_host_alias "$name")"
@@ -1825,6 +1997,7 @@ print_list_detail() {
   printf '\nconfig:\n'
   printf '  ports: ssh=%s novnc=%s cua=%s\n' "$ssh_port" "$novnc_port" "$cua_port"
   printf '  binds: ssh=%s novnc=%s cua=%s\n' "$ssh_bind" "$novnc_bind" "$cua_bind"
+  printf '  memory limit: %s\n' "$memory_summary"
 }
 
 cmd_list() {
@@ -1841,12 +2014,15 @@ cmd_list() {
     return
   fi
 
+  local rows line name status
+  rows="$(mktemp)"
+  lxc_query list --format csv -c ns >"$rows"
   printf '%-28s %-10s %-24s %-28s %s\n' "NAME" "STATUS" "SSH" "NOVNC" "EXPOSURE"
-  local line name status
   while IFS=, read -r name status _rest; do
     [ -n "$name" ] || continue
     print_list_row "$name" "$status"
-  done < <(lxc list --format csv -c ns)
+  done <"$rows"
+  rm -f "$rows"
 }
 
 cmd_destroy() {

@@ -9,7 +9,7 @@ run inside with computer use against that desktop.
 Use the root CLI:
 
 ```bash
-sandbox create NAME [--port-base N] [--user USER]
+sandbox create NAME [--port-base N] [--user USER] [--memory LIMIT]
 sandbox update NAME
 sandbox start NAME
 sandbox stop NAME
@@ -116,6 +116,16 @@ user has passwordless sudo.
 sandbox create agent-001 --port-base 2230
 ```
 
+New boxes default to `limits.memory=100GiB` so runaway builds OOM inside their
+own box instead of starving the host and LXD. Use `--memory LIMIT` to choose a
+different LXD memory limit, for example:
+
+```bash
+sandbox create agent-001 --memory 64GiB
+```
+
+Use `--memory none` only for boxes that intentionally need all host memory.
+
 Ports are always contiguous:
 
 - SSH: `PORT_BASE`
@@ -174,6 +184,7 @@ Each service has an explicit host bind address recorded in the host mirror:
 SSH_BIND=127.0.0.1
 NOVNC_BIND=127.0.0.1
 CUA_BIND=127.0.0.1
+MEMORY_LIMIT=100GiB
 ```
 
 Default is `127.0.0.1` (Spark-local). Use `--public` or per-service
