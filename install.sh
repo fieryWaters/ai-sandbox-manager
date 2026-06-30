@@ -7,6 +7,7 @@ die() { printf '[ai-sandbox-install][error] %s\n' "$*" >&2; exit 1; }
 log() { printf '[ai-sandbox-install] %s\n' "$*"; }
 
 [ "$(id -u)" -eq 0 ] || die "Run install.sh as root"
+[ "$#" -eq 0 ] || die "install.sh does not accept arguments"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -51,6 +52,30 @@ apt_get() {
     rm -f "$output"
     return "$status"
   done
+}
+
+sync_git_repo() {
+  local url="$1"
+  local dir="$2"
+  local ref
+  if [ -d "$dir/.git" ]; then
+    git -C "$dir" remote set-url origin "$url" >/dev/null 2>&1 || true
+    git -C "$dir" fetch --depth 1 origin
+    git -C "$dir" remote set-head origin -a >/dev/null 2>&1 || true
+    ref="$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    if [ -z "$ref" ]; then
+      if git -C "$dir" rev-parse --verify origin/main >/dev/null 2>&1; then
+        ref="origin/main"
+      else
+        ref="origin/master"
+      fi
+    fi
+    git -C "$dir" reset --hard "$ref"
+    git -C "$dir" clean -fdx
+  else
+    rm -rf "$dir"
+    git clone --depth 1 "$url" "$dir"
+  fi
 }
 
 validate_user() {
@@ -175,25 +200,34 @@ fi
 # Desktop stack: noVNC, cua computer-server, agent CLIs, Playwright Chromium
 # ---------------------------------------------------------------------------
 
-log "Installing noVNC"
-rm -rf /opt/noVNC
-git clone --depth 1 https://github.com/trycua/noVNC.git /opt/noVNC
-git clone --depth 1 https://github.com/novnc/websockify /opt/noVNC/utils/websockify
+log "Installing/updating noVNC"
+sync_git_repo https://github.com/trycua/noVNC.git /opt/noVNC
+sync_git_repo https://github.com/novnc/websockify /opt/noVNC/utils/websockify
 ln -sf /opt/noVNC/vnc.html /opt/noVNC/index.html
 
-log "Installing cua computer-server"
-rm -rf /opt/cua-computer-server
-python3 -m venv /opt/cua-computer-server
+log "Installing/updating cua computer-server"
+if [ ! -x /opt/cua-computer-server/bin/python ]; then
+  rm -rf /opt/cua-computer-server
+  python3 -m venv /opt/cua-computer-server
+fi
 /opt/cua-computer-server/bin/pip install --upgrade pip setuptools wheel
-/opt/cua-computer-server/bin/pip install 'cua-computer-server[vnc]'
+/opt/cua-computer-server/bin/pip install --upgrade 'cua-computer-server[vnc]'
 
-log "Installing Codex, Claude Code, and Playwright"
-# Older sandbox builds installed Codex under /usr/local, which shadows the
-# current NodeSource npm global prefix (/usr) on PATH. Remove that stale copy so
-# update always repairs the agent to the freshly installed managed CLI.
-rm -f /usr/local/bin/codex
-rm -rf /usr/local/lib/node_modules/@openai/codex
-npm install -g @openai/codex @anthropic-ai/claude-code playwright
+log "Installing/updating Playwright browser dependencies"
+# Claude and Codex are user-owned so agents can auto-update them. Remove stale
+# root npm globals from older boxes so /usr/bin does not shadow ~/.local/bin.
+npm uninstall -g @openai/codex @anthropic-ai/claude-code >/dev/null 2>&1 || true
+rm -f /usr/local/bin/codex /usr/local/bin/claude
+rm -rf /usr/local/lib/node_modules/@openai/codex /usr/local/lib/node_modules/@anthropic-ai/claude-code
+for cli in /usr/bin/codex /usr/bin/claude; do
+  target="$(readlink "$cli" 2>/dev/null || true)"
+  case "$target" in
+    *node_modules/@openai/codex*|*node_modules/@anthropic-ai/claude-code*)
+      rm -f "$cli"
+      ;;
+  esac
+done
+npm install -g playwright
 PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright playwright install --with-deps chromium
 
 # ---------------------------------------------------------------------------
@@ -238,7 +272,12 @@ install -d -o "$SANDBOX_USER" -g "$SANDBOX_USER" \
   "$USER_HOME/.ssh" \
   "$USER_HOME/git-repos" \
   "$USER_HOME/workspace" \
-  "$USER_HOME/.vnc"
+  "$USER_HOME/.vnc" \
+  "$USER_HOME/.local" \
+  "$USER_HOME/.local/bin" \
+  "$USER_HOME/.local/share" \
+  "$USER_HOME/.npm-global" \
+  "$USER_HOME/.npm-global/bin"
 
 cat >"$USER_HOME/cua-test.html" <<'EOF'
 <!doctype html>
@@ -252,11 +291,113 @@ cat >"$USER_HOME/cua-test.html" <<'EOF'
 EOF
 chown "$SANDBOX_USER:$SANDBOX_USER" "$USER_HOME/cua-test.html"
 
+log "Configuring user-owned CLI paths"
+runuser -u "$SANDBOX_USER" -- bash -lc '
+  set -euo pipefail
+  mkdir -p "$HOME/.local/bin" "$HOME/.npm-global/bin"
+  npm config set prefix "$HOME/.npm-global" >/dev/null
+  for file in "$HOME/.profile" "$HOME/.bashrc"; do
+    touch "$file"
+    sed -i "/^# >>> ai-sandbox managed PATH$/,/^# <<< ai-sandbox managed PATH$/d" "$file"
+    printf "\n# >>> ai-sandbox managed PATH\ncase \":\$PATH:\" in *\":\$HOME/.local/bin:\"*) ;; *) PATH=\"\$HOME/.local/bin:\$PATH\" ;; esac\ncase \":\$PATH:\" in *\":\$HOME/.npm-global/bin:\"*) ;; *) PATH=\"\$HOME/.npm-global/bin:\$PATH\" ;; esac\nexport PATH\n# <<< ai-sandbox managed PATH\n" >>"$file"
+  done
+'
+
+log "Installing/updating user-owned Codex CLI"
+runuser -u "$SANDBOX_USER" -- bash -lc '
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+  curl -fsSL https://chatgpt.com/codex/install.sh \
+    | CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR="$HOME/.local/bin" sh
+  if command -v codex >/dev/null 2>&1; then
+    if ! timeout 300 codex update </dev/null; then
+      printf "[ai-sandbox-install][warn] codex update failed; continuing\n" >&2
+    fi
+  fi
+'
+
+log "Installing/updating user-owned Claude Code CLI"
+rm -f /etc/claude-code/managed-settings.d/90-ai-sandbox-updates.json
+runuser -u "$SANDBOX_USER" -- bash -lc '
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+  curl -fsSL https://claude.ai/install.sh | bash -s -- latest
+  if command -v claude >/dev/null 2>&1; then
+    if ! timeout 300 claude update </dev/null; then
+      printf "[ai-sandbox-install][warn] claude update failed; continuing\n" >&2
+    fi
+  fi
+'
+
+log "Installing/updating user-owned OpenCode CLI"
+runuser -u "$SANDBOX_USER" -- bash -lc '
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+  curl -fsSL https://opencode.ai/install | bash
+'
+
+# OpenCode config: NeuralWatt provider + full-auto permissions. The API key
+# is resolved from the environment via {env:NEURALWATT_API_KEY}, which is
+# synced from the host by the sandbox CLI (sync_host_opencode_profile).
+log "Writing OpenCode config"
+install -d -m 755 -o "$SANDBOX_USER" -g "$SANDBOX_USER" "$USER_HOME/.config/opencode"
+cat >"$USER_HOME/.config/opencode/opencode.jsonc" <<'OPENCODE_JSONC'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "neuralwatt/glm-5.2",
+  "permission": {
+    "*": "allow",
+    "websearch": "allow",
+    "webfetch": "allow"
+  },
+  "provider": {
+    "neuralwatt": {
+      "name": "Neuralwatt",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://api.neuralwatt.com/v1",
+        "apiKey": "{env:NEURALWATT_API_KEY}"
+      },
+      "models": {
+        "glm-5.2": {
+          "name": "GLM-5.2",
+          "limit": {
+            "context": 1048576,
+            "output": 131072
+          }
+        }
+      }
+    }
+  }
+}
+OPENCODE_JSONC
+chown "$SANDBOX_USER:$SANDBOX_USER" "$USER_HOME/.config/opencode/opencode.jsonc"
+
 if [ -d "$REPO_DIR/codex/skills" ]; then
   log "Installing repo Codex skills"
   install -d -m 755 -o "$SANDBOX_USER" -g "$SANDBOX_USER" "$USER_HOME/.codex/skills"
-  tar -C "$REPO_DIR/codex/skills" -cf - . \
-    | tar -C "$USER_HOME/.codex/skills" -xf -
+  for skill in "$REPO_DIR"/codex/skills/*; do
+    [ -d "$skill" ] || continue
+    skill_name="$(basename "$skill")"
+    rm -rf "$USER_HOME/.codex/skills/$skill_name"
+    install -d -m 755 -o "$SANDBOX_USER" -g "$SANDBOX_USER" "$USER_HOME/.codex/skills/$skill_name"
+    tar -C "$skill" -cf - . \
+      | tar -C "$USER_HOME/.codex/skills/$skill_name" -xf -
+  done
+fi
+
+if [ -d "$REPO_DIR/codex/skills" ]; then
+  log "Installing repo Claude skills"
+  install -d -m 755 -o "$SANDBOX_USER" -g "$SANDBOX_USER" "$USER_HOME/.claude/skills"
+  for skill in "$REPO_DIR"/codex/skills/*; do
+    [ -d "$skill" ] || continue
+    skill_name="$(basename "$skill")"
+    rm -rf "$USER_HOME/.claude/skills/$skill_name"
+    install -d -m 755 -o "$SANDBOX_USER" -g "$SANDBOX_USER" "$USER_HOME/.claude/skills/$skill_name"
+    tar -C "$skill" -cf - . \
+      | tar -C "$USER_HOME/.claude/skills/$skill_name" -xf -
+  done
+  chown -R "$SANDBOX_USER:$SANDBOX_USER" "$USER_HOME/.claude/skills"
 fi
 
 # The git push guard is hook-based. Host-synced hooks win; otherwise install
@@ -276,7 +417,11 @@ runuser -u "$SANDBOX_USER" -- bash -c '
   mkdir -p ~/.codex
   touch ~/.codex/config.toml
   # Top-level TOML keys must precede any [table], so prepend.
-  sed -i -e "/^approval_policy *=/d" -e "/^sandbox_mode *=/d" ~/.codex/config.toml
+  sed -i \
+    -e "/^approval_policy *=/d" \
+    -e "/^sandbox_mode *=/d" \
+    -e "/^check_for_update_on_startup *=/d" \
+    ~/.codex/config.toml
   printf "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n" \
     | cat - ~/.codex/config.toml > ~/.codex/config.toml.new
   mv ~/.codex/config.toml.new ~/.codex/config.toml
@@ -340,5 +485,6 @@ runuser -u "$SANDBOX_USER" -- bash -lc '
 
 systemctl daemon-reload
 systemctl enable --now sandbox-vnc.service sandbox-novnc.service sandbox-cua-server.service
+systemctl restart sandbox-vnc.service sandbox-novnc.service sandbox-cua-server.service
 
 log "Install complete"

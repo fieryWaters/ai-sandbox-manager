@@ -95,16 +95,21 @@ state and must not be deleted.
 `sandbox create` and `sandbox update` sync host agent profiles into the box:
 
 - **Codex**: `~/.codex` auth, config, `AGENTS.md`, hooks (including the
-  git-push guard), rules, memories, plus repo skills. Approval bypass is set
-  in `config.toml` (`approval_policy`, `sandbox_mode`) — no shell aliases.
+  git-push guard), rules, memories, global skills, plus repo skills. Approval
+  bypass is set in `config.toml` (`approval_policy`, `sandbox_mode`) — no
+  shell aliases.
 - **Claude Code**: `~/.claude/.credentials.json`, `settings.json`,
   `CLAUDE.md`, agents, and skills, plus a minimal `~/.claude.json` (onboarding
   complete, bypass-permissions accepted, host account identity). Claude runs
   non-interactively as `claude -p --dangerously-skip-permissions ...`.
 
+Claude and Codex CLIs are installed under the box user (`~/.local/bin`) so
+their own update commands can run without root-owned npm prefix errors.
+
 Codex behavior rules that must load in every new agent belong in the host
-`~/.codex/AGENTS.md`; Claude equivalents belong in the host `~/.claude/CLAUDE.md`.
-Both are copied on create/update.
+`~/.codex/AGENTS.md`; reusable Codex workflows belong in host
+`~/.codex/skills/`. Claude equivalents belong in the host
+`~/.claude/CLAUDE.md`. These files are copied on create/update.
 
 `git push` is blocked for Codex by the hook in `codex/hooks/`. This is an
 advisory guard against accidental pushes, not a security boundary — the box
@@ -158,8 +163,10 @@ sandbox start NAME
 ```
 
 Stop preserves the LXD instance, `box.env`, SSH key, managed SSH config, and
-LXD proxy devices. Stopped boxes still reserve their configured three-port
-block, so new boxes will not accidentally reuse their ports.
+LXD proxy devices, and disables host-boot autostart. Stopped boxes still
+reserve their configured three-port block, so new boxes will not accidentally
+reuse their ports. Start enables host-boot autostart again and returns only
+after `ssh NAME hostname` succeeds with the expected hostname.
 
 ## Copy And Export
 
@@ -227,7 +234,7 @@ sandbox update NAME
 
 Update is the repair operation: starts the box if needed, reads the host
 mirror, regenerates proxy devices and SSH config, syncs this checkout and the
-host Codex/Claude profiles in, runs `uninstall-managed.sh` then `install.sh`,
+host Codex/Claude profiles in, runs `install.sh`, restarts managed services,
 and finishes with doctor. If the recorded port block is no longer free, update
 warns and moves the box to the next free block.
 
@@ -251,7 +258,7 @@ that retry behavior; never delete lock files or disable the security timers.
 sandbox doctor NAME
 ```
 
-Checks, in order: LXD instance, the three host ports, `ssh NAME`, hostname,
+Checks, in order: LXD instance, the three host ports, `ssh NAME hostname`,
 noVNC HTTP, computer-server `/status`, Codex login, Claude auth (a real
 one-shot prompt), the deskbot command surface, direct deskbot screenshot
 pixels, a Codex-mediated deskbot browser smoke (trace must show deskbot and
@@ -260,40 +267,21 @@ checks validate a magenta test page actually rendered on the shared desktop.
 
 ## Testing Strategy
 
-Run the host CLI from a neutral directory, not from the repo checkout:
+The fast regression test reproduces the misplaced-SSH-Include failure with a
+temporary config and the real OpenSSH parser:
+
+```bash
+bash tests/ssh-config-regression.sh
+```
+
+The acceptance suite runs the installed CLI from a neutral directory against
+real disposable LXD boxes. It covers every advertised command, including a
+clean install, direct SSH, HTTP services, lifecycle operations, update repair,
+copy, export/import, public exposure, GitHub grant/revoke, and destruction:
 
 ```bash
 cd ~
-command -v sandbox
-sandbox help
-```
-
-Required smoke on a throwaway box:
-
-```bash
-sandbox create sandbox-smoke --port-base 2250
-sandbox list sandbox-smoke
-sandbox view sandbox-smoke
-sandbox list
-sandbox ssh sandbox-smoke -- hostname
-sandbox stop sandbox-smoke
-sandbox start sandbox-smoke
-sandbox doctor sandbox-smoke
-sandbox update sandbox-smoke
-```
-
-Required clone/export smoke:
-
-```bash
-sandbox stop sandbox-smoke
-sandbox copy sandbox-smoke sandbox-copy
-sandbox doctor sandbox-copy
-sandbox stop sandbox-copy
-sandbox export sandbox-copy
-sandbox create sandbox-import --from sandbox-copy
-sandbox doctor sandbox-import
-printf 'sandbox-copy\n' | sandbox destroy sandbox-copy
-printf 'sandbox-import\n' | sandbox destroy sandbox-import
+/mnt/external_ssd/git-repos/ai-sandbox-manager/tests/acceptance.sh
 ```
 
 To test the apt lock retry deterministically, hold the real apt lists lock in
@@ -306,11 +294,5 @@ lxc exec sandbox-smoke -- python3 -c 'import fcntl, time; f=open("/var/lib/apt/l
 The pass condition is install output showing `apt is busy; waiting`, then
 continuing after the lock releases.
 
-After the throwaway path passes, test update on the persistent known-good box:
-
-```bash
-sandbox update youart-agent-base
-sandbox doctor youart-agent-base
-```
-
-Do not destroy `youart-agent-base`.
+The acceptance suite never uses or destroys `youart-agent-base` or
+`youart-agent-test`.

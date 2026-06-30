@@ -123,26 +123,28 @@ EOF
       cat <<'EOF'
 sandbox update NAME
 
-Repairs an existing box: syncs this checkout into the VM, regenerates
-managed proxy devices and SSH config from box.env, runs uninstall-managed,
-runs install, and then runs doctor. It preserves user browser/Codex
-state and does not migrate the create-time user.
+Updates an existing box: syncs this checkout into the VM, regenerates
+managed proxy devices and SSH config from box.env, syncs host agent profiles,
+runs install, and then runs doctor. It preserves durable user state and does
+not migrate the create-time user.
 EOF
       ;;
     start)
       cat <<'EOF'
 sandbox start NAME
 
-Starts a stopped box, refreshes its managed SSH config from box.env, waits for
-basic SSH, and prints the noVNC URL. Run doctor when you want full validation.
+Starts a stopped box, enables host-boot autostart, refreshes its managed SSH
+config from box.env, waits for `ssh NAME hostname` to return NAME, and prints
+the noVNC URL. Run doctor when you want full validation.
 EOF
       ;;
     stop)
       cat <<'EOF'
 sandbox stop NAME
 
-Stops a box without deleting it. Host-side state, SSH keys, archive files,
-box.env, and reserved LXD proxy devices are preserved.
+Stops a box and disables host-boot autostart without deleting it. Host-side
+state, SSH keys, archive files, box.env, and reserved LXD proxy devices are
+preserved.
 EOF
       ;;
     copy|cp)
@@ -317,17 +319,19 @@ ensure_ssh_include() {
   chmod 600 "$SSH_CONFIG"
 
   local include_line="Include ${SSH_MANAGED_CONFIG}"
-  if ! awk -v wanted_include="$include_line" '
-    $0 == wanted_include { found=1 }
-    $0 == "Include ~/.ai-sandbox/ssh/config" { found=1 }
-    END { exit found ? 0 : 1 }
-  ' "$SSH_CONFIG"; then
-    local tmp
-    tmp="$(mktemp)"
-    {
-      printf '%s\n' "$include_line"
-      cat "$SSH_CONFIG"
-    } >"$tmp"
+  local tmp
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' "$include_line"
+    awk -v wanted_include="$include_line" '
+      $0 == wanted_include { next }
+      $0 == "Include ~/.ai-sandbox/ssh/config" { next }
+      { print }
+    ' "$SSH_CONFIG"
+  } >"$tmp"
+  if cmp -s "$tmp" "$SSH_CONFIG"; then
+    rm -f "$tmp"
+  else
     cat "$tmp" >"$SSH_CONFIG"
     rm -f "$tmp"
   fi
@@ -503,9 +507,24 @@ instance_status() {
   printf '%s\n' "$INSTANCE_STATUS"
 }
 
+instance_has_lxc_monitor() {
+  local name="$1"
+  ps -eo args= \
+    | awk -v name="$name" '$1 == "[lxc" && $2 == "monitor]" && $NF == name { found=1 } END { exit found ? 0 : 1 }'
+}
+
+instance_lxd_split_brain() {
+  local name="$1"
+  local status="$2"
+  [ "$status" = "ERROR" ] && instance_has_lxc_monitor "$name"
+}
+
 start_instance() {
   local name="$1"
   load_instance_status "$name" || return 1
+  if instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then
+    die "${name} is in LXD split-brain state: LXD reports ERROR while a container monitor is still live; run: sandbox stop ${name}"
+  fi
   if [ "$INSTANCE_STATUS" = "STOPPED" ]; then
     lxc start "$name"
   fi
@@ -834,7 +853,9 @@ load_lxd_memory_limit() {
 apply_memory_limit() {
   local name="$1"
   local memory_limit="$2"
-  [ -n "$memory_limit" ] || return
+  if [ -z "$memory_limit" ]; then
+    return 0
+  fi
   validate_memory_limit "$memory_limit"
   if [ "$memory_limit" = "none" ]; then
     log "Leaving ${name} without a memory cap"
@@ -1211,7 +1232,7 @@ sync_host_codex_profile() {
   [ -d "$source" ] || return
   local items=()
   local rel
-  for rel in auth.json config.toml AGENTS.md AGENTS.override.md hooks.json hooks rules memories; do
+  for rel in auth.json config.toml AGENTS.md AGENTS.override.md hooks.json hooks rules memories skills; do
     [ -e "$source/$rel" ] && items+=("$rel")
   done
   [ "${#items[@]}" -gt 0 ] || return
@@ -1262,15 +1283,38 @@ sync_host_claude_profile() {
   "
 }
 
+sync_host_opencode_profile() {
+  local name="$1"
+  local user="$2"
+  local source="${HOME}/.config/opencode"
+  [ -d "$source" ] || return 0
+
+  log "Importing host OpenCode config for ${user}"
+  lxc exec "$name" -- bash -lc "install -d -m 755 -o '$user' -g '$user' '/home/$user/.config/opencode'"
+  tar -C "$source" -cf - opencode.jsonc opencode.json \
+    2>/dev/null | lxc exec "$name" -- tar -C "/home/$user/.config/opencode" -xf - 2>/dev/null || true
+  lxc exec "$name" -- bash -lc "chown -R '$user:$user' '/home/$user/.config/opencode' 2>/dev/null || true"
+
+  # Sync the API key into the box's bashrc so {env:NEURALWATT_API_KEY} resolves.
+  local api_key="${NEURALWATT_API_KEY:-}"
+  if [ -n "$api_key" ]; then
+    local rc_tmp
+    rc_tmp="$(mktemp)"
+    printf '\n# >>> ai-sandbox opencode env\nexport NEURALWATT_API_KEY=%q\n# <<< ai-sandbox opencode env\n' "$api_key" >"$rc_tmp"
+    for rc_file in ".bashrc" ".profile"; do
+      lxc exec "$name" -- bash -lc "sed -i '/^# >>> ai-sandbox opencode env\$/,/^# <<< ai-sandbox opencode env\$/d' '/home/$user/$rc_file' 2>/dev/null || true"
+      lxc file push -p "$rc_tmp" "$name/home/$user/$rc_file.ai-sandbox-opencode-env"
+      lxc exec "$name" -- bash -lc "cat '/home/$user/$rc_file.ai-sandbox-opencode-env' >> '/home/$user/$rc_file'; rm -f '/home/$user/$rc_file.ai-sandbox-opencode-env'; chown '$user:$user' '/home/$user/$rc_file'"
+    done
+    rm -f "$rc_tmp"
+  fi
+}
+
 run_install() {
   local name="$1"
   local user="$2"
-  local uninstall_first="${3:-no}"
   local repo_dir
   repo_dir="$(repo_dir_for_user "$user")"
-  if [ "$uninstall_first" = "yes" ]; then
-    lxc exec "$name" -- bash -lc "cd '$repo_dir' && bash ./uninstall-managed.sh"
-  fi
   lxc exec "$name" -- bash -lc "cd '$repo_dir' && bash ./install.sh"
 }
 
@@ -1343,24 +1387,46 @@ tcp_check() {
 
 ssh_hostname_matches() {
   local name="$1"
-  [ "$(ssh -o BatchMode=yes "$name" hostname)" = "$name" ]
+  local actual
+  actual="$(timeout 8 ssh \
+    -o BatchMode=yes \
+    -o ConnectTimeout=5 \
+    -o ConnectionAttempts=1 \
+    "$name" hostname)" || return
+  if [ "$actual" != "$name" ]; then
+    printf 'Expected SSH hostname %s, got %s\n' "$name" "$actual" >&2
+    return 1
+  fi
 }
 
 doctor() {
   local name="$1"
   local failures=0
   local label
+  local -a passed_checks=()
+  local -a failed_checks=()
+  local -a skipped_checks=()
   check_doctor() {
     label="$1"
     shift
     printf '[doctor] %-32s' "$label"
     if "$@" >/tmp/ai-sandbox-doctor.out 2>/tmp/ai-sandbox-doctor.err; then
       printf ' ok\n'
+      passed_checks+=("$label")
+      return 0
     else
       printf ' FAIL\n' >&2
       sed 's/^/[doctor][stderr] /' /tmp/ai-sandbox-doctor.err >&2 || true
+      failed_checks+=("$label")
       failures=$((failures + 1))
+      return 1
     fi
+  }
+  skip_doctor() {
+    label="$1"
+    shift
+    printf '[doctor] %-32s skipped (%s)\n' "$label" "$*"
+    skipped_checks+=("$label")
   }
   retry_doctor() {
     # 90s window: right after create/update the desktop services have just
@@ -1377,7 +1443,17 @@ doctor() {
     "$@"
   }
 
+  # Run every check even if earlier ones fail, so the user sees a complete
+  # picture in one pass instead of fixing failures one at a time.
+  set +e
+
   check_doctor "LXD instance" lxc_query info "$name"
+  if load_instance_status "$name" && instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then
+    printf '[doctor] %-32s FAIL\n' "LXD split-brain" >&2
+    printf '[doctor][stderr] LXD reports ERROR while a container monitor is still live; disable autostart and recover LXD before update/start.\n' >&2
+    failed_checks+=("LXD split-brain")
+    failures=$((failures + 1))
+  fi
   if [ -n "${MEMORY_LIMIT:-}" ]; then
     check_doctor "Memory cap ${MEMORY_LIMIT}" memory_limit_matches "$name" "$MEMORY_LIMIT"
   else
@@ -1387,8 +1463,7 @@ doctor() {
   check_doctor "SSH port ${SSH_PORT}" retry_doctor tcp_check "$SSH_PORT"
   check_doctor "noVNC port ${NOVNC_PORT}" retry_doctor tcp_check "$NOVNC_PORT"
   check_doctor "CUA port ${CUA_PORT}" retry_doctor tcp_check "$CUA_PORT"
-  check_doctor "ssh ${name}" ssh -o BatchMode=yes "$name" hostname
-  check_doctor "VM hostname" ssh_hostname_matches "$name"
+  check_doctor "ssh ${name} hostname" ssh_hostname_matches "$name"
   if github_state_granted; then
     printf '[doctor] %-32s granted (%s)\n' "GitHub access" "$GITHUB_SSH_KEY_FINGERPRINT"
     check_doctor "GitHub SSH auth" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
@@ -1415,11 +1490,22 @@ doctor() {
   vm_doctor="$(repo_dir_for_user "$SANDBOX_USER")/vm/doctor"
 
   check_doctor "VM Codex login" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "codex login status 2>&1 | grep -q 'Logged in'"
-  check_doctor "VM Claude auth" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
+  local claude_auth_ok=0
+  if check_doctor "VM Claude auth" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
     set -euo pipefail
+    cd "$HOME"
     test -s "$HOME/.claude/.credentials.json"
-    timeout 120 claude -p "Reply with exactly: ok" | grep -qi "ok"
-  '
+    out="$(timeout 120 claude -p --model sonnet --dangerously-skip-permissions -- "Reply with exactly: ok" </dev/null 2>&1)" || {
+      printf "%s\n" "$out" >&2
+      exit 1
+    }
+    printf "%s\n" "$out" | grep -qi "ok" || {
+      printf "%s\n" "$out" >&2
+      exit 1
+    }
+  '; then
+    claude_auth_ok=1
+  fi
   check_doctor "VM deskbot" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
     set -euo pipefail
     command -v deskbot >/dev/null
@@ -1429,11 +1515,11 @@ doctor() {
     set -euo pipefail
     cd \"\$HOME\"
     image=/tmp/ai-sandbox-deskbot.jpg
+    profile=/tmp/ai-sandbox-deskbot-profile
     url='data:text/html,%3C!doctype%20html%3E%3Ctitle%3Eai-sandbox%3C/title%3E%3Cbody%20style%3D%22margin%3A0%3Bbackground%3A%23ff00ff%3Bcolor%3Awhite%3Bfont%3A48px%20sans-serif%22%3EAI%20Sandbox%20Deskbot%20Doctor%3C/body%3E'
+    rm -rf \"\$profile\" \"\$image\"
     deskbot --reset >/tmp/ai-sandbox-deskbot-reset.out
-    deskbot --bash \"chromium --new-window '\$url' >/tmp/ai-sandbox-deskbot-chromium.log 2>&1 &\"
-    sleep 3
-    deskbot --screenshot \"\$image\" >/tmp/ai-sandbox-deskbot-screenshot.out
+    deskbot --bash \"CHROMIUM_USER_DATA_DIR=\\\"\$profile\\\" chromium --new-window '\$url' >/tmp/ai-sandbox-deskbot-chromium.log 2>&1 & sleep 6; wmctrl -a ai-sandbox 2>/dev/null || true; wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz 2>/dev/null || true; deskbot --screenshot '\$image'\" >/tmp/ai-sandbox-deskbot-screenshot.out
     python3 '${vm_doctor}/check_pixels.py' \"\$image\"
   "
   check_doctor "VM Codex deskbot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
@@ -1446,21 +1532,56 @@ doctor() {
     # codex exec may clean up background child processes between separate
     # command executions. Keep browser launch, paint wait, and screenshot in
     # one command execution so the browser is alive when pixels are captured.
-    prompt='Read ~/.codex/skills/deskbot/SKILL.md if present. Then run one shell command execution that resets stale Chromium windows, opens file:///tmp/ai-sandbox-codex-deskbot.html in Chromium, waits at least 6 seconds for the page to paint, and takes a screenshot exactly at /tmp/ai-sandbox-codex-deskbot.jpg. Do not split the launch and screenshot into separate command executions. The command should be equivalent to: deskbot --reset && deskbot --bash \"chromium --new-window file:///tmp/ai-sandbox-codex-deskbot.html >/tmp/deskbot-chromium.log 2>&1 & sleep 6; deskbot --screenshot /tmp/ai-sandbox-codex-deskbot.jpg\". Do not edit files.'
-    timeout 600 codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \"\$prompt\" </dev/null >\"\$trace\" 2>&1
-    python3 '${vm_doctor}/check_agent_trace.py' \"\$trace\" /tmp/ai-sandbox-codex-deskbot-commands.json
-    python3 '${vm_doctor}/check_pixels.py' \"\$image\"
+    prompt='Read ~/.codex/skills/deskbot/SKILL.md if present. Then run one shell command execution that resets stale Chromium windows, opens file:///tmp/ai-sandbox-codex-deskbot.html in Chromium with CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-codex-deskbot-profile, waits at least 6 seconds for the page to paint, and takes a screenshot exactly at /tmp/ai-sandbox-codex-deskbot.jpg. Do not split the launch and screenshot into separate command executions. The command should be equivalent to: deskbot --reset && deskbot --bash \"rm -rf /tmp/ai-sandbox-codex-deskbot-profile; CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-codex-deskbot-profile chromium --new-window file:///tmp/ai-sandbox-codex-deskbot.html >/tmp/deskbot-chromium.log 2>&1 & sleep 6; wmctrl -a ai-sandbox-codex 2>/dev/null || true; deskbot --screenshot /tmp/ai-sandbox-codex-deskbot.jpg\". Do not edit files.'
+    timeout 600 codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \"\$prompt\" </dev/null >\"\$trace\" 2>&1 || {
+      tail -n 50 \"\$trace\" >&2 || true
+      exit 1
+    }
+    python3 '${vm_doctor}/check_agent_trace.py' \"\$trace\" /tmp/ai-sandbox-codex-deskbot-commands.json || {
+      tail -n 50 \"\$trace\" >&2 || true
+      exit 1
+    }
+    python3 '${vm_doctor}/check_pixels.py' \"\$image\" || {
+      ls -l \"\$image\" >&2 2>/dev/null || echo \"no screenshot produced\" >&2
+      exit 1
+    }
   "
-  check_doctor "VM Claude deskbot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
-    set -euo pipefail
-    cd \"\$HOME\"
-    image=/tmp/ai-sandbox-claude-deskbot.jpg
-    rm -f \"\$image\"
-    printf '%s\n' '<!doctype html>' '<title>ai-sandbox-claude</title>' '<body style=\"margin:0;background:#ff00ff;color:white;font:48px sans-serif\">AI Sandbox Claude Deskbot Doctor</body>' >/tmp/ai-sandbox-claude-deskbot.html
-    prompt='Read ~/.codex/skills/deskbot/SKILL.md if present. Then run one shell command that resets stale Chromium windows, opens file:///tmp/ai-sandbox-claude-deskbot.html in Chromium, waits at least 6 seconds for the page to paint, and takes a screenshot exactly at /tmp/ai-sandbox-claude-deskbot.jpg. Use deskbot only; do not use ffmpeg, xdotool, or HTTP APIs. The command should be equivalent to: deskbot --reset && deskbot --bash \"chromium --new-window file:///tmp/ai-sandbox-claude-deskbot.html >/tmp/deskbot-chromium.log 2>&1 & sleep 6; deskbot --screenshot /tmp/ai-sandbox-claude-deskbot.jpg\". Do not edit files.'
-    timeout 600 claude -p --dangerously-skip-permissions \"\$prompt\" </dev/null >/tmp/ai-sandbox-claude-deskbot.out 2>&1
-    python3 '${vm_doctor}/check_pixels.py' \"\$image\"
-  "
+  if [ "$claude_auth_ok" -eq 1 ]; then
+    check_doctor "VM Claude deskbot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
+      set -euo pipefail
+      cd \"\$HOME\"
+      image=/tmp/ai-sandbox-claude-deskbot.jpg
+      rm -f \"\$image\"
+      printf '%s\n' '<!doctype html>' '<title>ai-sandbox-claude</title>' '<body style=\"margin:0;background:#ff00ff;color:white;font:48px sans-serif\">AI Sandbox Claude Deskbot Doctor</body>' >/tmp/ai-sandbox-claude-deskbot.html
+      prompt='Read ~/.claude/skills/deskbot/SKILL.md if present. Then run one Bash command that resets stale Chromium windows, opens file:///tmp/ai-sandbox-claude-deskbot.html in Chromium with CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-claude-deskbot-profile, waits at least 6 seconds for the page to paint, and takes a screenshot exactly at /tmp/ai-sandbox-claude-deskbot.jpg. Use deskbot only; do not use ffmpeg, xdotool, or HTTP APIs. The command should be equivalent to: deskbot --reset && deskbot --bash \"rm -rf /tmp/ai-sandbox-claude-deskbot-profile; CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-claude-deskbot-profile chromium --new-window file:///tmp/ai-sandbox-claude-deskbot.html >/tmp/deskbot-chromium.log 2>&1 & sleep 6; wmctrl -a ai-sandbox-claude 2>/dev/null || true; deskbot --screenshot /tmp/ai-sandbox-claude-deskbot.jpg\". Do not edit files.'
+      timeout 600 claude -p --model sonnet --dangerously-skip-permissions --allowedTools Bash -- \"\$prompt\" </dev/null >/tmp/ai-sandbox-claude-deskbot.out 2>&1 || {
+        tail -n 50 /tmp/ai-sandbox-claude-deskbot.out >&2 || true
+        exit 1
+      }
+      python3 '${vm_doctor}/check_pixels.py' \"\$image\" || {
+        ls -l \"\$image\" >&2 2>/dev/null || echo \"no screenshot produced\" >&2
+        exit 1
+      }
+    "
+  else
+    skip_doctor "VM Claude deskbot smoke" "Claude auth failed"
+  fi
+
+  set -e
+
+  printf '\n[doctor] Checklist for %s:\n' "$name"
+  local check
+  for check in "${passed_checks[@]}"; do
+    printf '  [x] %s\n' "$check"
+  done
+  for check in "${failed_checks[@]}"; do
+    printf '  [ ] %s\n' "$check"
+  done
+  for check in "${skipped_checks[@]}"; do
+    printf '  [-] %s\n' "$check"
+  done
+  printf '[doctor] %d passed, %d failed, %d skipped\n' \
+    "${#passed_checks[@]}" "${#failed_checks[@]}" "${#skipped_checks[@]}"
 
   rm -f /tmp/ai-sandbox-doctor.out /tmp/ai-sandbox-doctor.err
   [ "$failures" -eq 0 ] || die "${failures} doctor check(s) failed"
@@ -1641,7 +1762,8 @@ cmd_create() {
   ensure_box_ssh_key "$name" "$user"
   sync_host_codex_profile "$name" "$user"
   sync_host_claude_profile "$name" "$user"
-  run_install "$name" "$user" no
+  sync_host_opencode_profile "$name" "$user"
+  run_install "$name" "$user"
   write_ssh_config "$name" "$user" "$SSH_PORT"
   if [ "$grant_github" = "yes" ]; then
     github_grant "$name"
@@ -1657,6 +1779,8 @@ cmd_update() {
   require_cmd ss
   local name="${1:-}"
   [ -n "$name" ] || die "Missing NAME"
+  shift || true
+  [ "$#" -eq 0 ] || die "Unexpected update argument: $1"
   validate_name "$name"
   instance_exists "$name" || die "LXD instance not found: ${name}"
   start_instance "$name"
@@ -1672,7 +1796,8 @@ cmd_update() {
   ensure_box_ssh_key "$name" "$SANDBOX_USER"
   sync_host_codex_profile "$name" "$SANDBOX_USER"
   sync_host_claude_profile "$name" "$SANDBOX_USER"
-  run_install "$name" "$SANDBOX_USER" yes
+  sync_host_opencode_profile "$name" "$SANDBOX_USER"
+  run_install "$name" "$SANDBOX_USER"
   write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
   cmd_doctor "$name"
   log "Updated ${name}"
@@ -1685,6 +1810,9 @@ cmd_start() {
   validate_name "$name"
   instance_exists "$name" || die "LXD instance not found: ${name}"
   load_instance_status "$name" || die "Could not read LXD status for ${name}"
+  if instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then
+    die "${name} is in LXD split-brain state: LXD reports ERROR while a container monitor is still live; run: sandbox stop ${name}"
+  fi
   if [ "$INSTANCE_STATUS" = "STOPPED" ]; then
     log "Starting ${name}"
     lxc start "$name"
@@ -1692,16 +1820,26 @@ cmd_start() {
     log "${name} is already ${INSTANCE_STATUS}"
   fi
   wait_for_lxc "$name"
+  log "Enabling ${name} autostart"
+  lxc config set "$name" boot.autostart true
   load_box_env "$name" || die "No box.env found; run update first"
   write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
-  local attempt
-  for attempt in $(seq 1 30); do
-    if tcp_check "$SSH_PORT"; then
+  local deadline ready="no" ssh_err
+  deadline=$((SECONDS + 30))
+  ssh_err="$(mktemp)"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if ssh_hostname_matches "$name" 2>"$ssh_err"; then
+      ready="yes"
       break
     fi
     sleep 1
   done
-  tcp_check "$SSH_PORT" || die "SSH port did not become ready: ${SSH_PORT}"
+  if [ "$ready" != "yes" ]; then
+    sed 's/^/[sandbox][ssh] /' "$ssh_err" >&2 || true
+    rm -f "$ssh_err"
+    die "SSH did not become usable: ssh ${name} hostname"
+  fi
+  rm -f "$ssh_err"
   printf 'SSH:   ssh %s\n' "$name"
   printf 'noVNC: http://127.0.0.1:%s/\n' "$NOVNC_PORT"
 }
@@ -1713,8 +1851,14 @@ cmd_stop() {
   validate_name "$name"
   instance_exists "$name" || die "LXD instance not found: ${name}"
   load_instance_status "$name" || die "Could not read LXD status for ${name}"
+  log "Disabling ${name} autostart"
+  lxc config set "$name" boot.autostart false
   if [ "$INSTANCE_STATUS" = "STOPPED" ]; then
     log "${name} is already STOPPED"
+    return
+  fi
+  if instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then
+    warn "${name} is in LXD split-brain state; autostart is disabled, but live container processes may require host/LXD recovery"
     return
   fi
   log "Stopping ${name}"
@@ -1933,6 +2077,11 @@ print_url_detail() {
 print_list_row() {
   local name="$1"
   local status="$2"
+  local warning=""
+  if instance_lxd_split_brain "$name" "$status"; then
+    status="ERROR*"
+    warning="; lxd split-brain"
+  fi
   if load_box_env "$name" >/dev/null 2>&1; then
     effective_proxy "$name" ai-sandbox-ssh "$SSH_BIND" "$SSH_PORT"
     local ssh_bind="$EFFECTIVE_BIND"
@@ -1947,9 +2096,9 @@ print_list_row() {
     novnc_host="$(first_service_addr "$novnc_bind")"
     exposure="$(summarize_exposure "$ssh_bind" "$novnc_bind" "$cua_bind")"
     printf '%-28s %-10s %-24s %-28s %s\n' \
-      "$name" "$status" "ssh $name" "http://${novnc_host}:${novnc_port}/" "$exposure"
+      "$name" "$status" "ssh $name" "http://${novnc_host}:${novnc_port}/" "${exposure}${warning}"
   else
-    printf '%-28s %-10s %-24s %-28s %s\n' "$name" "$status" "-" "-" "unmanaged"
+    printf '%-28s %-10s %-24s %-28s %s\n' "$name" "$status" "-" "-" "unmanaged${warning}"
   fi
 }
 
@@ -1961,6 +2110,9 @@ print_list_detail() {
 
   printf 'name: %s\n' "$name"
   printf 'status: %s\n' "$INSTANCE_STATUS"
+  if instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then
+    printf 'warning: LXD split-brain; status is ERROR while a container monitor is still live\n'
+  fi
   if ! load_box_env "$name" >/dev/null 2>&1; then
     printf 'managed: no\n'
     printf 'box.env: missing\n'
