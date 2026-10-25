@@ -67,10 +67,18 @@ screenshot() {
   mkdir -p "$(dirname "$output")"
   tmp="$(mktemp --tmpdir deskbot-screenshot.XXXXXX.xwd)"
   require_display
-  if ! xwd -display "$DISPLAY" -root -silent -out "$tmp"; then
-    rm -f "$tmp"
-    return 1
-  fi
+  # Right after the desktop starts, the X server accepts connections a few
+  # seconds before its screen can be captured; until then xwd fails with
+  # BadMatch. Retry for up to 15 seconds instead of failing on the first try.
+  local attempts=0
+  until xwd -display "$DISPLAY" -root -silent -out "$tmp"; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 15 ]; then
+      rm -f "$tmp"
+      return 1
+    fi
+    sleep 1
+  done
   if ! xwdtopnm "$tmp" 2>/dev/null | pnmtojpeg >"$output"; then
     rm -f "$tmp"
     return 1

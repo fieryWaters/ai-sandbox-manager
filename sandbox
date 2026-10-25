@@ -1,290 +1,59 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-resolve_script_path() {
-  local source="${BASH_SOURCE[0]}"
-  local dir
-  while [ -L "$source" ]; do
-    dir="$(cd -P "$(dirname "$source")" && pwd)"
-    source="$(readlink "$source")"
-    case "$source" in
-      /*) ;;
-      *) source="${dir}/${source}" ;;
-    esac
-  done
-  dir="$(cd -P "$(dirname "$source")" && pwd)"
-  printf '%s/%s\n' "$dir" "$(basename "$source")"
-}
+# ai-sandbox-manager: create and manage LXD-based desktop sandboxes for AI agents.
 
-SCRIPT_PATH="$(resolve_script_path)"
-REPO_ROOT="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+# ── Constants ──────────────────────────────────────────────────────────────────
 
+REPO_ROOT="$(cd -P "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 DEFAULT_IMAGE="ubuntu:24.04"
 DEFAULT_USER="agent"
 DEFAULT_PORT_BASE="2230"
 DEFAULT_BIND="127.0.0.1"
 DEFAULT_MEMORY_LIMIT="100GiB"
-LXC_QUERY_TIMEOUT_SECONDS="10"
 CONFIG_REL=".ai-sandbox/box.env"
 REPO_REL=".ai-sandbox/ai-sandbox-manager"
 STATE_DIR="${HOME}/.ai-sandbox"
 ARCHIVE_DIR="${STATE_DIR}/archives"
 BOX_STATE_DIR="${STATE_DIR}/boxes"
 SSH_DIR="${STATE_DIR}/ssh"
+SSH_KEY_DIR="$SSH_DIR"
 SSH_MANAGED_CONFIG="${SSH_DIR}/config"
 SSH_CONFIG="${HOME}/.ssh/config"
-SSH_KEY_DIR="$SSH_DIR"
 SSH_KNOWN_HOSTS="${SSH_DIR}/known_hosts"
 
-exec 9>&2
+# ── Utilities ──────────────────────────────────────────────────────────────────
 
-log() { printf '[sandbox] %s\n' "$*"; }
+log()  { printf '[sandbox] %s\n' "$*"; }
 warn() { printf '[sandbox][warn] %s\n' "$*" >&2; }
-die() { printf '[sandbox][error] %s\n' "$*" >&2; exit 1; }
+die()  { printf '[sandbox][error] %s\n' "$*" >&2; exit 1; }
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
 
-usage() {
-  cat <<'EOF'
-Usage:
-  sandbox create NAME [--port-base N] [--user USER] [--bind ADDR]
-                         [--ssh-bind ADDR] [--novnc-bind ADDR] [--cua-bind ADDR]
-                         [--memory LIMIT] [--public] [--github]
-                         [--from ARCHIVE_OR_NAME]
-  sandbox update NAME
-  sandbox start NAME
-  sandbox stop NAME
-  sandbox copy SOURCE DEST [--port-base N] [--bind ADDR]
-  sandbox export NAME [FILE]
-  sandbox github NAME [--revoke]
-  sandbox doctor NAME
-  sandbox view NAME
-  sandbox ssh NAME [-- COMMAND...]
-  sandbox list [NAME]
-  sandbox destroy NAME
-  sandbox help [COMMAND]
+# Run a shell command inside the VM as root
+vm_exec() { lxc exec "$1" -- bash -lc "$2"; }
 
-Core defaults:
-  --user agent
-  --port-base first free block from 2230
-  --bind 127.0.0.1
-  --memory 100GiB
+# Run a shell command inside the VM as a specific user
+vm_user() { lxc exec "$1" -- runuser -u "$2" -- bash -lc "$3"; }
 
-Ports are always contiguous:
-  SSH          PORT_BASE
-  noVNC        PORT_BASE + 1
-  CUA fallback PORT_BASE + 2
-
-Bind addresses:
-  127.0.0.1 keeps a service local to Spark.
-  0.0.0.0 exposes a service on all host interfaces.
-  --public is shorthand for --bind 0.0.0.0.
-
-Host-side state:
-  ~/.ai-sandbox/boxes     Host mirror of each box's tiny config.
-  ~/.ai-sandbox/ssh       SSH keys, known-hosts, and managed SSH config.
-  ~/.ai-sandbox/archives  Default export/import location.
-
-Desktop automation contract:
-  Agents use deskbot from the shell, or cua computer-server (port 8000)
-  programmatically. Both drive the box's one native desktop. noVNC shows
-  that same desktop to humans.
-EOF
-}
-
-command_help() {
-  case "${1:-}" in
-    create)
-      cat <<'EOF'
-sandbox create NAME [options]
-
-Creates an Ubuntu LXD box, writes /home/USER/.ai-sandbox/box.env,
-syncs this repo into the VM, installs managed tooling, writes SSH config,
-and runs doctor.
-
-With --from, imports an archive instead of launching a clean Ubuntu image.
-ARCHIVE_OR_NAME may be an explicit tarball path or a name in
-~/.ai-sandbox/archives/NAME.tar.gz. Imported boxes keep their VM state, but
-get fresh host ports, fresh host SSH keys, and rewritten managed config.
-
-Options:
-  --port-base N       Use N,N+1,N+2 for SSH,noVNC,CUA. Fails if busy.
-  --user USER         Runtime user for clean creates. Default: agent.
-  --bind ADDR         Bind all host proxies to 127.0.0.1 or 0.0.0.0.
-  --ssh-bind ADDR     Bind only SSH host proxy.
-  --novnc-bind ADDR   Bind only noVNC host proxy.
-  --cua-bind ADDR     Bind only CUA fallback host proxy.
-  --memory LIMIT      Set LXD limits.memory after launch. Default: 100GiB.
-                      Use --memory none to leave the box uncapped.
-  --public            Bind all services to 0.0.0.0.
-  --github            Grant GitHub SSH push access after install.
-  --from SOURCE       Import from SOURCE tarball or default archive name.
-EOF
-      ;;
-    update)
-      cat <<'EOF'
-sandbox update NAME
-
-Updates an existing box: syncs this checkout into the VM, regenerates
-managed proxy devices and SSH config from box.env, syncs host agent profiles,
-runs install, and then runs doctor. It preserves durable user state and does
-not migrate the create-time user.
-EOF
-      ;;
-    start)
-      cat <<'EOF'
-sandbox start NAME
-
-Starts a stopped box, enables host-boot autostart, refreshes its managed SSH
-config from box.env, waits for `ssh NAME hostname` to return NAME, and prints
-the noVNC URL. Run doctor when you want full validation.
-EOF
-      ;;
-    stop)
-      cat <<'EOF'
-sandbox stop NAME
-
-Stops a box and disables host-boot autostart without deleting it. Host-side
-state, SSH keys, archive files, box.env, and reserved LXD proxy devices are
-preserved.
-EOF
-      ;;
-    copy|cp)
-      cat <<'EOF'
-sandbox copy SOURCE DEST [options]
-sandbox cp SOURCE DEST [options]
-
-Copies a stopped sandbox into a new sandbox using LXD. DEST receives a fresh
-host SSH key, the next free port block unless --port-base is supplied, and
-localhost-only exposure unless bind options are supplied.
-
-Options:
-  --port-base N       Use N,N+1,N+2 for SSH,noVNC,CUA. Fails if reserved.
-  --bind ADDR         Bind all host proxies to 127.0.0.1 or 0.0.0.0.
-  --ssh-bind ADDR     Bind only SSH host proxy.
-  --novnc-bind ADDR   Bind only noVNC host proxy.
-  --cua-bind ADDR     Bind only CUA fallback host proxy.
-  --public            Bind all services to 0.0.0.0.
-EOF
-      ;;
-    export)
-      cat <<'EOF'
-sandbox export NAME [FILE]
-
-Exports a stopped sandbox with lxc export. Without FILE, writes:
-
-  ~/.ai-sandbox/archives/NAME.tar.gz
-
-The box must be stopped first so the archive is consistent.
-EOF
-      ;;
-    github)
-      cat <<'EOF'
-sandbox github NAME [--revoke]
-
-Grants a box GitHub SSH push access without placing GitHub tokens in the box.
-The box owns its ~/.ssh/id_ed25519 keypair; the host gh CLI registers the
-public key on the GitHub account, seeds github.com known_hosts in the box, and
-sets the box git identity.
-
-Options:
-  --revoke           Delete the recorded GitHub account key and clear state.
-EOF
-      ;;
-    doctor)
-      cat <<'EOF'
-sandbox doctor NAME
-
-Checks LXD, ports, ssh NAME, noVNC, computer-server /status, Codex login,
-Claude auth, GitHub SSH access when granted, the deskbot command surface, real
-deskbot screenshot pixels, a Codex-mediated deskbot browser smoke whose trace
-must show the canonical deskbot path, and a Claude-mediated deskbot browser
-smoke.
-EOF
-      ;;
-    view)
-      cat <<'EOF'
-sandbox view NAME
-
-Prints only the noVNC URL for the box.
-EOF
-      ;;
-    ssh)
-      cat <<'EOF'
-sandbox ssh NAME [-- COMMAND...]
-
-Refreshes the managed SSH config block for NAME, then opens an interactive
-SSH session or runs COMMAND through that host alias. Managed hosts use
-~/.ai-sandbox/ssh/known_hosts with a per-box HostKeyAlias, so reused localhost
-ports do not collide with global SSH known-hosts entries.
-EOF
-      ;;
-    list)
-      cat <<'EOF'
-sandbox list [NAME]
-
-Without NAME, prints a compact overview of current LXD instances.
-
-With NAME, prints the detailed access view for one box: user, private key path,
-known-host alias, SSH commands, noVNC URLs, CUA URLs, ports, bind addresses,
-and memory limit. It does not print private key contents.
-EOF
-      ;;
-    destroy)
-      cat <<'EOF'
-sandbox destroy NAME
-
-Revokes the recorded GitHub account key when granted, deletes the LXD instance,
-removes only the matching managed SSH config block, removes that box's unique
-SSH keypair from ~/.ai-sandbox/ssh, and removes that box's managed known-hosts
-entry.
-
-Destroy requires typing the exact box name at the confirmation prompt.
-EOF
-      ;;
-    *)
-      usage
-      ;;
-  esac
-}
-
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
-}
-
-lxc_query_timeout_error() {
-  printf '[sandbox][error] LXD daemon unresponsive (timed out after %ss) -- host may be under memory pressure\n' "$LXC_QUERY_TIMEOUT_SECONDS" >&9
-  exit 1
-}
+# ── LXD queries with timeout ──────────────────────────────────────────────────
 
 _lxc_query() {
-  local quiet="$1"
-  shift
-  require_cmd timeout
+  local quiet="$1"; shift
   local err status
   err="$(mktemp)"
-  if timeout "$LXC_QUERY_TIMEOUT_SECONDS" lxc "$@" 2>"$err"; then
-    rm -f "$err"
-    return 0
+  if timeout 10 lxc "$@" 2>"$err"; then
+    rm -f "$err"; return 0
   else
     status="$?"
   fi
-  if [ "$status" -eq 124 ]; then
-    rm -f "$err"
-    lxc_query_timeout_error
-  fi
-  if [ "$quiet" != "yes" ]; then
-    cat "$err" >&2
-  fi
-  rm -f "$err"
-  return "$status"
+  [ "$status" -eq 124 ] && { rm -f "$err"; die "LXD daemon unresponsive (timed out)"; }
+  [ "$quiet" = "yes" ] || cat "$err" >&2
+  rm -f "$err"; return "$status"
 }
+lxc_query()      { _lxc_query no "$@"; }
+lxc_query_quiet() { _lxc_query yes "$@"; }
 
-lxc_query() {
-  _lxc_query no "$@"
-}
-
-lxc_query_quiet() {
-  _lxc_query yes "$@"
-}
+# ── State dirs & SSH config management ────────────────────────────────────────
 
 ensure_state_dirs() {
   mkdir -p "$STATE_DIR" "$ARCHIVE_DIR" "$BOX_STATE_DIR" "$SSH_DIR"
@@ -293,102 +62,109 @@ ensure_state_dirs() {
   chmod 600 "$SSH_MANAGED_CONFIG"
 }
 
-remove_managed_ssh_block_from_file() {
-  local file="$1"
-  local name="$2"
+host_box_env_path() { printf '%s/%s.env' "$BOX_STATE_DIR" "$1"; }
+repo_dir_for_user() { printf '/home/%s/%s' "$1" "$REPO_REL"; }
+archive_path_for_name() { printf '%s/%s.tar.gz' "$ARCHIVE_DIR" "$1"; }
+managed_host_alias() { printf 'ai-sandbox-%s' "$1"; }
+
+# Remove a managed block (between marker comments) from a file
+remove_managed_block_from_file() {
+  local file="$1" name="$2"
   [ -f "$file" ] || return
-  local tmp
-  tmp="$(mktemp)"
-  awk -v name="$name" '
-    $0 == "# >>> ai-sandbox " name { skip=1; next }
-    $0 == "# <<< ai-sandbox " name { skip=0; next }
+  local tmp; tmp="$(mktemp)"
+  awk -v n="$name" '
+    $0 == "# >>> ai-sandbox " n { skip=1; next }
+    $0 == "# <<< ai-sandbox " n { skip=0; next }
     !skip { print }
-  ' "$file" >"$tmp"
-  cat "$tmp" >"$file"
+  ' "$file" >"$tmp" && cat "$tmp" >"$file"
   rm -f "$tmp"
 }
 
-shell_quote() {
-  printf '%q' "$1"
+remove_managed_ssh_block() {
+  remove_managed_block_from_file "$SSH_CONFIG" "$1"
+  remove_managed_block_from_file "$SSH_MANAGED_CONFIG" "$1"
 }
 
+# Ensure ~/.ssh/config has exactly one Include for the managed config at the top
 ensure_ssh_include() {
   ensure_state_dirs
   mkdir -p "$(dirname "$SSH_CONFIG")"
-  touch "$SSH_CONFIG"
-  chmod 600 "$SSH_CONFIG"
-
-  local include_line="Include ${SSH_MANAGED_CONFIG}"
-  local tmp
-  tmp="$(mktemp)"
+  touch "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+  local inc="Include ${SSH_MANAGED_CONFIG}"
+  local tmp; tmp="$(mktemp)"
   {
-    printf '%s\n' "$include_line"
-    awk -v wanted_include="$include_line" '
-      $0 == wanted_include { next }
-      $0 == "Include ~/.ai-sandbox/ssh/config" { next }
-      { print }
-    ' "$SSH_CONFIG"
+    printf '%s\n' "$inc"
+    awk -v i="$inc" '$0 == i || $0 == "Include ~/.ai-sandbox/ssh/config" { next } { print }' "$SSH_CONFIG"
   } >"$tmp"
-  if cmp -s "$tmp" "$SSH_CONFIG"; then
-    rm -f "$tmp"
-  else
-    cat "$tmp" >"$SSH_CONFIG"
-    rm -f "$tmp"
-  fi
+  cat "$tmp" >"$SSH_CONFIG"
+  rm -f "$tmp"
 }
 
-validate_name() {
+# Check if ~/.ssh/config has an unmanaged Host entry for this name
+ssh_host_exists_unmanaged() {
   local name="$1"
-  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid name: ${name}"
+  [ -f "$SSH_CONFIG" ] || return 1
+  awk -v n="$name" '
+    $0 == "# >>> ai-sandbox " n { managed=1 }
+    $0 == "# <<< ai-sandbox " n { managed=0; next }
+    managed { next }
+    /^[[:space:]]*Host[[:space:]]+/ { for (i=2;i<=NF;i++) if ($i==n) found=1 }
+    END { exit found ? 0 : 1 }
+  ' "$SSH_CONFIG"
 }
 
-validate_user() {
-  local user="$1"
-  [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "Invalid user: ${user}"
+write_ssh_config() {
+  local name="$1" user="$2" port="$3"
+  local key_path="${SSH_KEY_DIR}/${name}_ed25519"
+  local host_alias; host_alias="$(managed_host_alias "$name")"
+  ensure_ssh_include
+  touch "$SSH_KNOWN_HOSTS"; chmod 600 "$SSH_KNOWN_HOSTS"
+  remove_managed_ssh_block "$name"
+  ssh_host_exists_unmanaged "$name" && die "~/.ssh/config has unmanaged Host ${name}; refusing to edit"
+  cat >>"$SSH_MANAGED_CONFIG" <<EOF
+
+# >>> ai-sandbox ${name}
+Host ${name}
+  HostName 127.0.0.1
+  User ${user}
+  Port ${port}
+  IdentityFile ${key_path}
+  IdentitiesOnly yes
+  UserKnownHostsFile ${SSH_KNOWN_HOSTS}
+  HostKeyAlias ${host_alias}
+  StrictHostKeyChecking accept-new
+# <<< ai-sandbox ${name}
+EOF
 }
 
+remove_managed_known_host() {
+  ensure_state_dirs
+  [ -f "$SSH_KNOWN_HOSTS" ] || return
+  ssh-keygen -f "$SSH_KNOWN_HOSTS" -R "ai-sandbox-$1" >/dev/null 2>&1 || true
+}
+
+# ── Validators ────────────────────────────────────────────────────────────────
+
+validate_name()      { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid name: $1"; }
+validate_user()      { [[ "$1" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "Invalid user: $1"; }
 validate_port_base() {
-  local base="$1"
-  [[ "$base" =~ ^[0-9]+$ ]] || die "Port base must be numeric: ${base}"
-  [ "$base" -ge 1024 ] || die "Port base must be >= 1024"
-  [ "$base" -le 65533 ] || die "Port base must be <= 65533"
+  [[ "$1" =~ ^[0-9]+$ ]] || die "Port base must be numeric: $1"
+  [ "$1" -ge 1024 ] && [ "$1" -le 65533 ] || die "Port base must be 1024-65533"
 }
-
+validate_memory_limit() {
+  [ -n "$1" ] || die "Memory limit must not be empty; use --memory none"
+  [ "$1" = "none" ] && return 0
+  [[ "$1" =~ ^[A-Za-z0-9._%+-]+$ ]] || die "Memory limit has unsupported characters: $1"
+}
 normalize_bind() {
-  local bind="$1"
-  case "$bind" in
+  case "$1" in
     localhost) printf '127.0.0.1' ;;
-    127.0.0.1|0.0.0.0) printf '%s' "$bind" ;;
-    *) die "Bind address must be 127.0.0.1, localhost, or 0.0.0.0: ${bind}" ;;
+    127.0.0.1|0.0.0.0) printf '%s' "$1" ;;
+    *) die "Bind must be 127.0.0.1, localhost, or 0.0.0.0: $1" ;;
   esac
 }
 
-validate_memory_limit() {
-  local limit="$1"
-  [ -n "$limit" ] || die "Memory limit must not be empty; use --memory none to skip the cap"
-  [ "$limit" = "none" ] && return
-  [[ "$limit" =~ ^[A-Za-z0-9._%+-]+$ ]] || die "Memory limit contains unsupported characters: ${limit}"
-}
-
-memory_limit_display() {
-  local recorded="$1"
-  local actual="$2"
-  if [ -n "$recorded" ]; then
-    if [ "$recorded" = "none" ]; then
-      if [ -n "$actual" ]; then
-        printf 'none (actual: %s)' "$actual"
-      else
-        printf 'none'
-      fi
-    elif [ -n "$actual" ] && [ "$actual" != "$recorded" ]; then
-      printf '%s (actual: %s)' "$recorded" "$actual"
-    else
-      printf '%s' "$recorded"
-    fi
-  else
-    printf 'unrecorded (actual: %s)' "${actual:-none}"
-  fi
-}
+# ── Port allocation ──────────────────────────────────────────────────────────
 
 ports_from_base() {
   PORT_BASE="$1"
@@ -397,485 +173,200 @@ ports_from_base() {
   CUA_PORT=$((PORT_BASE + 2))
 }
 
-port_listening() {
-  local port="$1"
-  ss -H -ltn 2>/dev/null | awk -v suffix=":${port}" '$4 ~ suffix "$" { found=1 } END { exit found ? 0 : 1 }'
-}
+port_listening() { ss -H -ltn 2>/dev/null | awk -v p=":$1" '$4 ~ p"$" { exit 0 } END { exit 1 }'; }
 
-configured_proxy_port_owner() {
-  local port="$1"
-  local exclude="${2:-}"
-  local rows name device listen_port
-  rows="$(mktemp)"
-  lxc_query list --format csv -c ns >"$rows"
-  while IFS=, read -r name _status; do
-    [ -n "$name" ] || continue
-    [ "$name" = "$exclude" ] && continue
-    for device in ai-sandbox-ssh ai-sandbox-novnc ai-sandbox-cua; do
-      load_device_listen "$name" "$device"
-      [ -n "$DEVICE_LISTEN" ] || continue
-      listen_port="$(parse_listen_port "$DEVICE_LISTEN")"
-      if [ "$listen_port" = "$port" ]; then
-        printf '%s' "$name"
-        rm -f "$rows"
-        return
-      fi
+# Which other instance owns a proxy on this port? Empty = none.
+proxy_port_owner() {
+  local port="$1" exclude="${2:-}" rows name listen_port
+  rows="$(lxc_query list --format csv -c ns 2>/dev/null)" || return 0
+  while IFS=, read -r name _; do
+    [ -n "$name" ] && [ "$name" != "$exclude" ] || continue
+    for dev in ai-sandbox-ssh ai-sandbox-novnc ai-sandbox-cua; do
+      listen_port="$(lxc_query_quiet config device get "$name" "$dev" listen 2>/dev/null | awk -F: '{print $NF}')"
+      [ "$listen_port" = "$port" ] && { printf '%s' "$name"; return; }
     done
-  done <"$rows"
-  rm -f "$rows"
+  done <<<"$rows"
 }
 
 busy_port_in_block() {
-  local base="$1"
-  local exclude="${2:-}"
+  local base="$1" exclude="${2:-}"
   ports_from_base "$base"
   local port
   for port in "$SSH_PORT" "$NOVNC_PORT" "$CUA_PORT"; do
-    if port_listening "$port"; then
-      printf '%s' "$port"
-      return
-    fi
-    if [ -n "$(configured_proxy_port_owner "$port" "$exclude")" ]; then
-      printf '%s' "$port"
-      return
+    if port_listening "$port" || [ -n "$(proxy_port_owner "$port" "$exclude")" ]; then
+      printf '%s' "$port"; return
     fi
   done
 }
 
-port_block_free() {
-  local base="$1"
-  local exclude="${2:-}"
-  [ -z "$(busy_port_in_block "$base" "$exclude")" ]
-}
+port_block_free() { [ -z "$(busy_port_in_block "$1" "${2:-}")" ]; }
 
 check_port_block_free() {
-  local base="$1"
-  local exclude="${2:-}"
-  local busy
-  busy="$(busy_port_in_block "$base" "$exclude")"
+  local busy; busy="$(busy_port_in_block "$1" "${2:-}")"
   [ -z "$busy" ] || die "Port ${busy} is already listening; choose another --port-base"
 }
 
 next_port_block_start() {
-  local base="$1"
-  local next=$(( ((base / 10) + 1) * 10 ))
+  local next=$(( (($1 / 10) + 1) * 10 ))
   [ "$next" -ge "$DEFAULT_PORT_BASE" ] || next="$DEFAULT_PORT_BASE"
   printf '%s' "$next"
 }
 
 find_free_port_base() {
-  local base="${1:-$DEFAULT_PORT_BASE}"
-  local exclude="${2:-}"
+  local base="${1:-$DEFAULT_PORT_BASE}" exclude="${2:-}"
   while [ "$base" -le 65533 ]; do
-    if port_block_free "$base" "$exclude"; then
-      printf '%s' "$base"
-      return
-    fi
+    port_block_free "$base" "$exclude" && { printf '%s' "$base"; return; }
     base=$((base + 10))
   done
-  die "Could not find a free contiguous three-port block"
+  die "No free contiguous three-port block"
 }
 
-generate_password() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 18 | tr -d '\n'
-  else
-    od -An -N18 -tx1 /dev/urandom | tr -d ' \n'
-  fi
-}
+generate_password() { openssl rand -hex 18 2>/dev/null || od -An -N18 -tx1 /dev/urandom | tr -d ' \n'; }
 
-instance_exists() {
-  lxc_query_quiet info "$1" >/dev/null
-}
+# ── Instance management ───────────────────────────────────────────────────────
+
+instance_exists() { lxc_query_quiet info "$1" >/dev/null; }
 
 load_instance_status() {
-  local name="$1"
-  local tmp
-  tmp="$(mktemp)"
-  if ! lxc_query_quiet info "$name" >"$tmp"; then
-    rm -f "$tmp"
-    INSTANCE_STATUS=""
-    return 1
+  local tmp; tmp="$(mktemp)"
+  if ! lxc_query_quiet info "$1" >"$tmp"; then
+    rm -f "$tmp"; INSTANCE_STATUS=""; return 1
   fi
   INSTANCE_STATUS="$(awk -F: '/^Status:/ { gsub(/^ +/, "", $2); status=$2 } END { print status }' "$tmp")"
   rm -f "$tmp"
   [ -n "$INSTANCE_STATUS" ]
 }
 
-instance_status() {
-  load_instance_status "$1" || return 1
-  printf '%s\n' "$INSTANCE_STATUS"
-}
-
 instance_has_lxc_monitor() {
-  local name="$1"
-  ps -eo args= \
-    | awk -v name="$name" '$1 == "[lxc" && $2 == "monitor]" && $NF == name { found=1 } END { exit found ? 0 : 1 }'
+  ps -eo args= | awk '$1 == "[lxc" && $2 == "monitor]" && $NF == "'"$1"'" { found=1 } END { exit found ? 0 : 1 }'
 }
 
-instance_lxd_split_brain() {
-  local name="$1"
-  local status="$2"
-  [ "$status" = "ERROR" ] && instance_has_lxc_monitor "$name"
-}
+instance_lxd_split_brain() { [ "$2" = "ERROR" ] && instance_has_lxc_monitor "$1"; }
 
 start_instance() {
-  local name="$1"
-  load_instance_status "$name" || return 1
-  if instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then
-    die "${name} is in LXD split-brain state: LXD reports ERROR while a container monitor is still live; run: sandbox stop ${name}"
+  load_instance_status "$1" || return 1
+  if instance_lxd_split_brain "$1" "$INSTANCE_STATUS"; then
+    die "$1 is in LXD split-brain (ERROR while monitor is live); run: sandbox stop $1"
   fi
-  if [ "$INSTANCE_STATUS" = "STOPPED" ]; then
-    lxc start "$name"
-  fi
+  if [ "$INSTANCE_STATUS" = "STOPPED" ]; then lxc start "$1"; fi
 }
 
 wait_for_lxc() {
-  local name="$1"
   local tries=60
-  until lxc exec "$name" -- true >/dev/null 2>&1; do
-    tries=$((tries - 1))
-    [ "$tries" -gt 0 ] || die "Timed out waiting for ${name}"
+  until lxc exec "$1" -- true >/dev/null 2>&1; do
+    [ $((tries--)) -gt 0 ] || die "Timed out waiting for $1"
     sleep 1
   done
 }
 
+# LXD's image template renames the box on create and copy, but not on import.
+# The 127.0.1.1 line lets `hostname -f` resolve without LXD's DNS (e.g. macvlan).
 set_vm_hostname() {
+  vm_exec "$1" "printf '%s\n' '$1' >/etc/hostname && hostname '$1' && sed -i '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts && printf '127.0.1.1 %s\n' '$1' >>/etc/hosts"
+}
+
+require_stopped_instance() {
   local name="$1"
-  lxc exec "$name" -- bash -lc "printf '%s\n' '$name' >/etc/hostname && hostname '$name'"
+  load_instance_status "$name" || die "Could not read LXD status for $name"
+  [ "$INSTANCE_STATUS" = "STOPPED" ] || die "$name must be stopped first; run: sandbox stop $name"
 }
 
-reset_cloned_network_identity() {
-  local name="$1"
-  # LXD archives can preserve the source NIC MAC. If the source still exists,
-  # LXD refuses to start the import with "MAC address ... already defined".
-  # Clearing it before first boot lets LXD generate a fresh managed MAC.
-  lxc config unset "$name" volatile.eth0.hwaddr >/dev/null 2>&1 || true
-}
-
-box_config_path() {
-  local user="$1"
-  printf '/home/%s/%s' "$user" "$CONFIG_REL"
-}
-
-host_box_env_path() {
-  local name="$1"
-  printf '%s/%s.env' "$BOX_STATE_DIR" "$name"
-}
-
-repo_dir_for_user() {
-  local user="$1"
-  printf '/home/%s/%s' "$user" "$REPO_REL"
-}
+# ── box.env persistence ───────────────────────────────────────────────────────
+# The host mirror is authoritative. The in-box copy exists for install.sh.
+# An agent with sudo must not be able to change its own exposure by editing
+# the in-box copy; load_box_env always re-mirrors to the host file.
 
 read_box_env() {
-  local name="$1"
-  # The host mirror is authoritative. The copy inside the box is written by
-  # the host for the installer's benefit and is never read back once a mirror
-  # exists — an agent with sudo in the box must not be able to change its own
-  # exposure. The in-box fallback only adopts boxes that predate mirrors
-  # (e.g. imported archives), and those values are validated by load_box_env.
-  local host_env
+  local name="$1" host_env
   host_env="$(host_box_env_path "$name")"
   if [ -f "$host_env" ]; then
-    cat "$host_env"
-    return 0
+    cat "$host_env"; return 0
   fi
   load_instance_status "$name" || return 1
   [ "$INSTANCE_STATUS" != "STOPPED" ] || return 1
-  lxc exec "$name" -- bash -lc '
-    for path in /home/*/.ai-sandbox/box.env; do
-      if [ -f "$path" ]; then
-        cat "$path"
-        exit 0
-      fi
-    done
-    exit 1
-  ' </dev/null 2>/dev/null
+  lxc exec "$name" -- bash -lc 'cat /home/*/.ai-sandbox/box.env 2>/dev/null || exit 1' </dev/null 2>/dev/null
 }
 
 load_box_env() {
-  local name="$1"
-  local tmp
+  local name="$1" tmp
   tmp="$(mktemp)"
   if ! read_box_env "$name" >"$tmp"; then
-    rm -f "$tmp"
-    return 1
+    rm -f "$tmp"; return 1
   fi
-  SANDBOX_USER=""
-  PORT_BASE=""
-  SSH_BIND=""
-  NOVNC_BIND=""
-  CUA_BIND=""
-  MEMORY_LIMIT=""
-  VNC_PASSWORD=""
-  GITHUB_SSH_KEY_TITLE=""
-  GITHUB_SSH_KEY_FINGERPRINT=""
-  GITHUB_SSH_KEY_ID=""
+  SANDBOX_USER=""; PORT_BASE=""; SSH_BIND=""; NOVNC_BIND=""; CUA_BIND=""
+  MEMORY_LIMIT=""; VNC_PASSWORD=""
+  GITHUB_SSH_KEY_TITLE=""; GITHUB_SSH_KEY_FINGERPRINT=""; GITHUB_SSH_KEY_ID=""
   local line key value
   while IFS= read -r line; do
-    case "$line" in
-      ''|'#'*) continue ;;
-      *=*)
-        key="${line%%=*}"
-        value="${line#*=}"
-        case "$key" in
-          SANDBOX_USER|PORT_BASE|SSH_BIND|NOVNC_BIND|CUA_BIND|MEMORY_LIMIT|VNC_PASSWORD|GITHUB_SSH_KEY_TITLE|GITHUB_SSH_KEY_FINGERPRINT|GITHUB_SSH_KEY_ID)
-            printf -v "$key" '%s' "$value"
-            ;;
-        esac
-        ;;
-    esac
+    case "$line" in ''|'#'*) continue ;; *=*)
+      key="${line%%=*}"; value="${line#*=}"
+      case "$key" in
+        SANDBOX_USER|PORT_BASE|SSH_BIND|NOVNC_BIND|CUA_BIND|MEMORY_LIMIT|VNC_PASSWORD \
+        |GITHUB_SSH_KEY_TITLE|GITHUB_SSH_KEY_FINGERPRINT|GITHUB_SSH_KEY_ID)
+          printf -v "$key" '%s' "$value" ;;
+      esac
+    ;; esac
   done <"$tmp"
   rm -f "$tmp"
-
   SANDBOX_USER="${SANDBOX_USER:-$DEFAULT_USER}"
-  PORT_BASE="${PORT_BASE:-}"
   SSH_BIND="${SSH_BIND:-$DEFAULT_BIND}"
   NOVNC_BIND="${NOVNC_BIND:-$DEFAULT_BIND}"
   CUA_BIND="${CUA_BIND:-$DEFAULT_BIND}"
-  [ -n "$VNC_PASSWORD" ] || return 1
-  [ -n "$PORT_BASE" ] || return 1
+  [ -n "$VNC_PASSWORD" ] && [ -n "$PORT_BASE" ] || return 1
   validate_user "$SANDBOX_USER"
   validate_port_base "$PORT_BASE"
-  if [ -n "$MEMORY_LIMIT" ]; then
-    validate_memory_limit "$MEMORY_LIMIT"
-  fi
+  [ -z "$MEMORY_LIMIT" ] || validate_memory_limit "$MEMORY_LIMIT"
   SSH_BIND="$(normalize_bind "$SSH_BIND")"
   NOVNC_BIND="$(normalize_bind "$NOVNC_BIND")"
   CUA_BIND="$(normalize_bind "$CUA_BIND")"
   ports_from_base "$PORT_BASE"
-  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" "$MEMORY_LIMIT"
+  write_host_env "$name"
 }
 
-load_device_listen() {
+# Write host-side mirror of box.env (includes GitHub state if set)
+write_host_env() {
   local name="$1"
-  local device="$2"
-  local tmp
-  tmp="$(mktemp)"
-  if lxc_query_quiet config device get "$name" "$device" listen >"$tmp"; then
-    DEVICE_LISTEN="$(cat "$tmp")"
-  else
-    DEVICE_LISTEN=""
-  fi
-  rm -f "$tmp"
-}
-
-device_listen() {
-  load_device_listen "$1" "$2"
-  printf '%s\n' "$DEVICE_LISTEN"
-}
-
-parse_listen_port() {
-  local listen="$1"
-  printf '%s' "$listen" | awk -F: '{ print $NF }'
-}
-
-parse_listen_bind() {
-  local listen="$1"
-  printf '%s' "$listen" | sed -E 's/^tcp:(.*):[0-9]+$/\1/'
-}
-
-host_network_interfaces() {
-  command -v ip >/dev/null 2>&1 || return
-  ip -o -4 addr show scope global up 2>/dev/null | awk '
-    function useful_interface(name) {
-      return name !~ /^(lo$|docker|br-|lxdbr|incusbr|virbr|veth|cni|flannel|kube|podman)/
-    }
-    {
-      name = $2
-      sub(/:$/, "", name)
-      split($4, addr, "/")
-      if (useful_interface(name) && !seen[addr[1]]++) {
-        print name, addr[1]
-      }
-    }
-  '
-}
-
-interface_label_for_ip() {
-  local ipaddr="$1"
-  local label addr
-  while read -r label addr; do
-    [ -n "$label" ] || continue
-    if [ "$addr" = "$ipaddr" ]; then
-      printf '%s' "$label"
-      return
+  ensure_state_dirs
+  {
+    printf 'SANDBOX_USER=%s\nPORT_BASE=%s\nVNC_PASSWORD=%s\nSSH_BIND=%s\nNOVNC_BIND=%s\nCUA_BIND=%s\n' \
+      "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
+    [ -z "${MEMORY_LIMIT:-}" ] || printf 'MEMORY_LIMIT=%s\n' "$MEMORY_LIMIT"
+    if [ -n "${GITHUB_SSH_KEY_FINGERPRINT:-}" ]; then
+      printf 'GITHUB_SSH_KEY_TITLE=%s\nGITHUB_SSH_KEY_FINGERPRINT=%s\n' \
+        "${GITHUB_SSH_KEY_TITLE:-}" "$GITHUB_SSH_KEY_FINGERPRINT"
+      [ -z "${GITHUB_SSH_KEY_ID:-}" ] || printf 'GITHUB_SSH_KEY_ID=%s\n' "$GITHUB_SSH_KEY_ID"
     fi
-  done < <(host_network_interfaces)
+  } > "$(host_box_env_path "$name")"
+  chmod 600 "$(host_box_env_path "$name")"
 }
 
-service_hosts_for_bind() {
-  local bind="$1"
-  local label
-  case "$bind" in
-    127.0.0.1|localhost)
-      printf 'local 127.0.0.1\n'
-      ;;
-    0.0.0.0)
-      printf 'local 127.0.0.1\n'
-      host_network_interfaces
-      ;;
-    *)
-      label="$(interface_label_for_ip "$bind")"
-      printf '%s %s\n' "${label:-host}" "$bind"
-      ;;
-  esac
+# Write box.env to both VM and host mirror
+write_box_env() {
+  local name="$1" user="$2" port_base="$3" vnc_password="$4"
+  local ssh_bind="$5" novnc_bind="$6" cua_bind="$7" memory_limit="${8:-}"
+  local content
+  content="SANDBOX_USER=${user}
+PORT_BASE=${port_base}
+VNC_PASSWORD=${vnc_password}
+SSH_BIND=${ssh_bind}
+NOVNC_BIND=${novnc_bind}
+CUA_BIND=${cua_bind}"
+  [ -n "$memory_limit" ] && content="${content}
+MEMORY_LIMIT=${memory_limit}" || true
+  # Write to VM
+  printf '%s\n' "$content" | vm_exec "$name" \
+    "install -d -m 700 -o '$user' -g '$user' /home/$user/.ai-sandbox; cat > /home/$user/.ai-sandbox/box.env; chown '$user' /home/$user/.ai-sandbox/box.env; chmod 600 /home/$user/.ai-sandbox/box.env"
+  # Write host mirror
+  SANDBOX_USER="$user"; PORT_BASE="$port_base"; VNC_PASSWORD="$vnc_password"
+  SSH_BIND="$ssh_bind"; NOVNC_BIND="$novnc_bind"; CUA_BIND="$cua_bind"; MEMORY_LIMIT="$memory_limit"
+  ports_from_base "$PORT_BASE"
+  write_host_env "$name"
 }
 
-effective_proxy() {
-  local name="$1"
-  local device="$2"
-  local fallback_bind="$3"
-  local fallback_port="$4"
-  EFFECTIVE_BIND="$fallback_bind"
-  EFFECTIVE_PORT="$fallback_port"
-  load_device_listen "$name" "$device"
-  if [ -n "$DEVICE_LISTEN" ]; then
-    EFFECTIVE_BIND="$(parse_listen_bind "$DEVICE_LISTEN")"
-    EFFECTIVE_PORT="$(parse_listen_port "$DEVICE_LISTEN")"
-  fi
-}
+# ── Box configuration ─────────────────────────────────────────────────────────
 
 ensure_user() {
-  local name="$1"
-  local user="$2"
-  lxc exec "$name" -- bash -lc "
-    set -e
-    if ! id '$user' >/dev/null 2>&1; then
-      useradd -m -s /bin/bash '$user'
-    fi
-    install -d -m 700 -o '$user' -g '$user' '/home/$user/.ai-sandbox'
-    install -d -m 700 -o '$user' -g '$user' '/home/$user/.ssh'
-  "
-}
-
-write_box_env() {
-  local name="$1"
-  local user="$2"
-  local port_base="$3"
-  local vnc_password="$4"
-  local ssh_bind="$5"
-  local novnc_bind="$6"
-  local cua_bind="$7"
-  local memory_limit="${8:-}"
-  local path
-  path="$(box_config_path "$user")"
-  local content
-  content="$(cat <<EOF
-SANDBOX_USER=${user}
-PORT_BASE=${port_base}
-VNC_PASSWORD=${vnc_password}
-SSH_BIND=${ssh_bind}
-NOVNC_BIND=${novnc_bind}
-CUA_BIND=${cua_bind}
-EOF
-)"
-  if [ -n "$memory_limit" ]; then
-    content="${content}
-MEMORY_LIMIT=${memory_limit}"
-  fi
-  printf '%s\n' "$content" | lxc exec "$name" -- bash -lc "
-    set -e
-    install -d -m 700 -o '$user' -g '$user' '/home/$user/.ai-sandbox'
-    cat > '$path'
-    chown '$user:$user' '$path'
-    chmod 600 '$path'
-  "
-  write_host_box_env "$name" "$user" "$port_base" "$vnc_password" "$ssh_bind" "$novnc_bind" "$cua_bind" "$memory_limit"
-}
-
-write_host_box_env() {
-  local name="$1"
-  local user="$2"
-  local port_base="$3"
-  local vnc_password="$4"
-  local ssh_bind="$5"
-  local novnc_bind="$6"
-  local cua_bind="$7"
-  local memory_limit="${8:-}"
-  ensure_state_dirs
-  local path
-  path="$(host_box_env_path "$name")"
-  {
-    cat <<EOF
-SANDBOX_USER=${user}
-PORT_BASE=${port_base}
-VNC_PASSWORD=${vnc_password}
-SSH_BIND=${ssh_bind}
-NOVNC_BIND=${novnc_bind}
-CUA_BIND=${cua_bind}
-EOF
-    if [ -n "$memory_limit" ]; then
-      printf 'MEMORY_LIMIT=%s\n' "$memory_limit"
-    fi
-    if [ -n "${GITHUB_SSH_KEY_TITLE:-}" ] && [ -n "${GITHUB_SSH_KEY_FINGERPRINT:-}" ]; then
-      printf 'GITHUB_SSH_KEY_TITLE=%s\n' "$GITHUB_SSH_KEY_TITLE"
-      printf 'GITHUB_SSH_KEY_FINGERPRINT=%s\n' "$GITHUB_SSH_KEY_FINGERPRINT"
-      if [ -n "${GITHUB_SSH_KEY_ID:-}" ]; then
-        printf 'GITHUB_SSH_KEY_ID=%s\n' "$GITHUB_SSH_KEY_ID"
-      fi
-    fi
-  } >"$path"
-  chmod 600 "$path"
-}
-
-remove_device_if_present() {
-  local name="$1"
-  local device="$2"
-  if lxc_query_quiet config device get "$name" "$device" type >/dev/null; then
-    lxc config device remove "$name" "$device" >/dev/null
-  fi
-}
-
-remove_proxy_devices() {
-  local name="$1"
-  remove_device_if_present "$name" ai-sandbox-ssh
-  remove_device_if_present "$name" ai-sandbox-novnc
-  remove_device_if_present "$name" ai-sandbox-cua
-  remove_device_if_present "$name" host-ssh
-  remove_device_if_present "$name" host-novnc
-  remove_device_if_present "$name" host-cua
-}
-
-load_lxd_memory_limit() {
-  local name="$1"
-  local tmp
-  tmp="$(mktemp)"
-  if lxc_query_quiet config get "$name" limits.memory >"$tmp"; then
-    LXD_MEMORY_LIMIT="$(cat "$tmp")"
-  else
-    LXD_MEMORY_LIMIT=""
-  fi
-  rm -f "$tmp"
-}
-
-apply_memory_limit() {
-  local name="$1"
-  local memory_limit="$2"
-  if [ -z "$memory_limit" ]; then
-    return 0
-  fi
-  validate_memory_limit "$memory_limit"
-  if [ "$memory_limit" = "none" ]; then
-    log "Leaving ${name} without a memory cap"
-    lxc config unset "$name" limits.memory >/dev/null 2>&1 || true
-    return
-  fi
-  # A cap makes a runaway build OOM inside its own box instead of starving host RAM and LXD.
-  log "Setting ${name} memory cap to ${memory_limit}"
-  lxc config set "$name" limits.memory "$memory_limit"
-}
-
-memory_limit_matches() {
-  local name="$1"
-  local expected="$2"
-  load_lxd_memory_limit "$name"
-  if [ "$expected" = "none" ]; then
-    [ -z "$LXD_MEMORY_LIMIT" ]
-  else
-    [ "$LXD_MEMORY_LIMIT" = "$expected" ]
-  fi
+  vm_exec "$1" "id '$2' >/dev/null 2>&1 || useradd -m -s /bin/bash '$2'; install -d -m 700 -o '$2' -g '$2' /home/$2/.ai-sandbox /home/$2/.ssh"
 }
 
 configure_base_lxd() {
@@ -889,118 +380,175 @@ configure_base_lxd() {
   fi
 }
 
-configure_proxy_devices() {
-  local name="$1"
-  local ssh_bind="$2"
-  local novnc_bind="$3"
-  local cua_bind="$4"
-  local reassign_if_busy="${5:-no}"
-
-  remove_proxy_devices "$name"
-
-  local busy
-  busy="$(busy_port_in_block "$PORT_BASE" "$name")"
-  if [ -n "$busy" ]; then
-    if [ "$reassign_if_busy" = "yes" ]; then
-      local old_port_base="$PORT_BASE"
-      PORT_BASE="$(find_free_port_base "$(next_port_block_start "$PORT_BASE")" "$name")"
-      ports_from_base "$PORT_BASE"
-      warn "Port ${busy} blocked ${name}'s configured block ${old_port_base}-$((old_port_base + 2)); moved to PORT_BASE=${PORT_BASE}"
-    else
-      die "Port ${busy} is already listening; choose another --port-base"
-    fi
-  else
-    ports_from_base "$PORT_BASE"
-  fi
-
-  lxc config device add "$name" ai-sandbox-ssh proxy \
-    listen="tcp:${ssh_bind}:${SSH_PORT}" \
-    connect="tcp:127.0.0.1:22" >/dev/null
-  lxc config device add "$name" ai-sandbox-novnc proxy \
-    listen="tcp:${novnc_bind}:${NOVNC_PORT}" \
-    connect="tcp:127.0.0.1:6901" >/dev/null
-  lxc config device add "$name" ai-sandbox-cua proxy \
-    listen="tcp:${cua_bind}:${CUA_PORT}" \
-    connect="tcp:127.0.0.1:8000" >/dev/null
+# Proxy device helpers
+load_device_listen() {
+  DEVICE_LISTEN="$(lxc_query_quiet config device get "$1" "$2" listen 2>/dev/null || true)"
 }
 
+parse_listen_port() { printf '%s' "$1" | awk -F: '{print $NF}'; }
+parse_listen_bind() { printf '%s' "$1" | sed -E 's/^tcp:(.*):[0-9]+$/\1/'; }
+
+effective_proxy() {
+  local listen
+  load_device_listen "$1" "$2"
+  if [ -n "$DEVICE_LISTEN" ]; then
+    EFFECTIVE_BIND="$(parse_listen_bind "$DEVICE_LISTEN")"
+    EFFECTIVE_PORT="$(parse_listen_port "$DEVICE_LISTEN")"
+  else
+    EFFECTIVE_BIND="$3"; EFFECTIVE_PORT="$4"
+  fi
+}
+
+remove_proxy_devices() {
+  local name="$1" dev
+  for dev in ai-sandbox-ssh ai-sandbox-novnc ai-sandbox-cua host-ssh host-novnc host-cua; do
+    if lxc_query_quiet config device get "$name" "$dev" type >/dev/null; then
+      lxc config device remove "$name" "$dev" >/dev/null
+    fi
+  done
+}
+
+configure_proxy_devices() {
+  local name="$1" ssh_bind="$2" novnc_bind="$3" cua_bind="$4" reassign_if_busy="${5:-no}"
+  remove_proxy_devices "$name"
+  local busy; busy="$(busy_port_in_block "$PORT_BASE" "$name")"
+  if [ -n "$busy" ]; then
+    [ "$reassign_if_busy" = "yes" ] || die "Port ${busy} is already listening; choose another --port-base"
+    local old="$PORT_BASE"
+    PORT_BASE="$(find_free_port_base "$(next_port_block_start "$PORT_BASE")" "$name")"
+    ports_from_base "$PORT_BASE"
+    warn "Port ${busy} blocked block ${old}-$((old + 2)); moved to PORT_BASE=${PORT_BASE}"
+  fi
+  lxc config device add "$name" ai-sandbox-ssh proxy \
+    listen="tcp:${ssh_bind}:${SSH_PORT}" connect="tcp:127.0.0.1:22" >/dev/null
+  lxc config device add "$name" ai-sandbox-novnc proxy \
+    listen="tcp:${novnc_bind}:${NOVNC_PORT}" connect="tcp:127.0.0.1:6901" >/dev/null
+  lxc config device add "$name" ai-sandbox-cua proxy \
+    listen="tcp:${cua_bind}:${CUA_PORT}" connect="tcp:127.0.0.1:8000" >/dev/null
+}
+
+# ── Memory limits ─────────────────────────────────────────────────────────────
+
+load_lxd_memory_limit() {
+  LXD_MEMORY_LIMIT="$(lxc_query_quiet config get "$1" limits.memory 2>/dev/null || true)"
+}
+
+apply_memory_limit() {
+  local name="$1" limit="$2"
+  [ -n "$limit" ] || return 0
+  validate_memory_limit "$limit"
+  if [ "$limit" = "none" ]; then
+    log "Leaving ${name} without a memory cap"
+    lxc config unset "$name" limits.memory >/dev/null 2>&1 || true
+    return
+  fi
+  log "Setting ${name} memory cap to ${limit}"
+  lxc config set "$name" limits.memory "$limit"
+}
+
+memory_limit_matches() {
+  load_lxd_memory_limit "$1"
+  if [ "$2" = "none" ]; then [ -z "$LXD_MEMORY_LIMIT" ]; else [ "$LXD_MEMORY_LIMIT" = "$2" ]; fi
+}
+
+# ── Clone helpers ─────────────────────────────────────────────────────────────
+
+# LXD archives can preserve the source NIC MAC; LXD refuses to start the
+# import if the source still exists. Clearing it lets LXD generate a fresh MAC.
+reset_cloned_network_identity() { lxc config unset "$1" volatile.eth0.hwaddr >/dev/null 2>&1 || true; }
+
 refresh_vm_vnc_password() {
-  local name="$1"
-  local user="$2"
-  local vnc_password="$3"
-  lxc exec "$name" -- bash -lc "
-    set -e
-    for env_file in /etc/ai-sandbox.env /etc/youart-agent.env; do
-      [ -f \"\$env_file\" ] || continue
-      sed -i \
-        -e 's/^VNC_PW=.*/VNC_PW=${vnc_password}/' \
-        -e 's/^CUA_VNC_PASSWORD=.*/CUA_VNC_PASSWORD=${vnc_password}/' \
-        \"\$env_file\"
-    done
-    install -d -m 700 -o '$user' -g '$user' '/home/$user/.vnc'
-    printf '%s\n' '${vnc_password}' | runuser -u '$user' -- vncpasswd -f > '/home/$user/.vnc/passwd'
-    chown '$user:$user' '/home/$user/.vnc/passwd'
-    chmod 600 '/home/$user/.vnc/passwd'
-    systemctl restart sandbox-vnc.service sandbox-novnc.service sandbox-cua-server.service 2>/dev/null ||
-      systemctl restart youart-vnc.service youart-novnc.service youart-cua-server.service 2>/dev/null || true
+  vm_exec "$1" "
+    sed -i -e 's/^VNC_PW=.*/VNC_PW=$3/' -e 's/^CUA_VNC_PASSWORD=.*/CUA_VNC_PASSWORD=$3/' /etc/ai-sandbox.env 2>/dev/null || true
+    install -d -m 700 -o '$2' -g '$2' '/home/$2/.vnc'
+    printf '%s\n' '$3' | runuser -u '$2' -- vncpasswd -f > '/home/$2/.vnc/passwd'
+    chown '$2:$2' '/home/$2/.vnc/passwd'; chmod 600 '/home/$2/.vnc/passwd'
+    systemctl restart sandbox-vnc.service sandbox-novnc.service sandbox-cua-server.service 2>/dev/null || true
   "
 }
 
 clear_vm_chromium_locks() {
-  local name="$1"
-  local user="$2"
-  lxc exec "$name" -- runuser -u "$user" -- bash -lc '
-    set -e
-    cd "$HOME"
-    if pgrep -u "$(id -u)" -x chromium >/dev/null 2>&1 ||
-      pgrep -u "$(id -u)" -x chrome >/dev/null 2>&1; then
-      exit 0
-    fi
-    for dir in "$HOME/.config/chromium" "$HOME/.config/google-chrome"; do
-      [ -d "$dir" ] || continue
-      find "$dir" -maxdepth 1 \( -name "SingletonLock" -o -name "SingletonSocket" -o -name "SingletonCookie" \) -delete
+  vm_user "$1" "$2" '
+    if pgrep -u "$(id -u)" -x chromium >/dev/null 2>&1 || pgrep -u "$(id -u)" -x chrome >/dev/null 2>&1; then exit 0; fi
+    for d in "$HOME/.config/chromium" "$HOME/.config/google-chrome"; do
+      [ -d "$d" ] || continue
+      find "$d" -maxdepth 1 \( -name "SingletonLock" -o -name "SingletonSocket" -o -name "SingletonCookie" \) -delete
     done
   '
 }
 
+# ── Sync: repo + profiles + SSH keys ─────────────────────────────────────────
+
 sync_repo_to_vm() {
-  local name="$1"
-  local user="$2"
-  local repo_dir
+  local name="$1" user="$2" repo_dir
   repo_dir="$(repo_dir_for_user "$user")"
-  log "Syncing this checkout to ${name}:${repo_dir}"
-  lxc exec "$name" -- bash -lc "
-    set -e
-    install -d -m 755 -o '$user' -g '$user' '$repo_dir'
-    find '$repo_dir' -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-  "
-  tar -C "$REPO_ROOT" \
-    --exclude='.git/index.lock' \
-    --exclude='.git/objects/pack/tmp_*' \
-    --exclude='.DS_Store' \
-    -cf - . \
+  log "Syncing checkout to ${name}:${repo_dir}"
+  vm_exec "$name" "install -d -m 755 -o '$user' -g '$user' '$repo_dir'; find '$repo_dir' -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"
+  tar -C "$REPO_ROOT" --exclude='.git/index.lock' --exclude='.git/objects/pack/tmp_*' --exclude='.DS_Store' -cf - . \
     | lxc exec "$name" -- tar -C "$repo_dir" -xf -
-  lxc exec "$name" -- bash -lc "
-    chown -R '$user:$user' '/home/$user/.ai-sandbox'
-    find '$repo_dir' -type f \( -name 'sandbox' -o -name 'install.sh' -o -name 'uninstall-managed.sh' -o -path '*/scripts/*.sh' \) -exec chmod +x {} + 2>/dev/null || true
-  "
+  vm_exec "$name" "chown -R '$user:$user' '/home/$user/.ai-sandbox'; find '$repo_dir' -type f \( -name 'sandbox' -o -name 'install.sh' -o -path '*/scripts/*.sh' \) -exec chmod +x {} + 2>/dev/null || true"
+}
+
+# Push a host directory into the VM via tar pipe
+push_dir_to_vm() {
+  local name="$1" source="$2" target="$3" mode="$4" user="$5"
+  shift 5
+  [ -d "$source" ] || return 0
+  local items=() rel
+  for rel in "$@"; do [ -e "$source/$rel" ] && items+=("$rel"); done || true
+  [ "${#items[@]}" -gt 0 ] || return 0
+  vm_user "$name" "$user" "mkdir -p -m ${mode} '$target'"
+  tar -C "$source" -cf - "${items[@]}" | lxc exec "$name" -- tar -C "$target" -xf -
+  vm_exec "$name" "chown -R '$user:$user' '$target'"
+}
+
+sync_profiles() {
+  local name="$1" user="$2"
+
+  # Codex
+  push_dir_to_vm "$name" "$HOME/.codex" "/home/$user/.codex" 700 "$user" \
+    auth.json config.toml AGENTS.md AGENTS.override.md hooks.json hooks rules memories skills
+  vm_exec "$name" "chmod 700 /home/$user/.codex; [ -f /home/$user/.codex/auth.json ] && chmod 600 /home/$user/.codex/auth.json; [ -f /home/$user/.codex/config.toml ] && chmod 600 /home/$user/.codex/config.toml; find /home/$user/.codex/hooks -type f -exec chmod 755 {} + 2>/dev/null || true"
+
+  # Claude
+  push_dir_to_vm "$name" "$HOME/.claude" "/home/$user/.claude" 700 "$user" \
+    .credentials.json settings.json CLAUDE.md agents skills
+  vm_exec "$name" "chmod 700 /home/$user/.claude; [ -f /home/$user/.claude/.credentials.json ] && chmod 600 /home/$user/.claude/.credentials.json"
+
+  # Claude onboarding JSON (minimal, without host project history)
+  if [ -f "$HOME/.claude.json" ] && command -v jq >/dev/null 2>&1; then
+    jq '{hasCompletedOnboarding: true, bypassPermissionsModeAccepted: true}
+        + (if .oauthAccount then {oauthAccount: .oauthAccount} else {} end)' \
+      "$HOME/.claude.json" \
+      | vm_exec "$name" "cat > /home/$user/.claude.json; chown '$user:$user' /home/$user/.claude.json; chmod 600 /home/$user/.claude.json"
+  fi
+
+  # OpenCode
+  push_dir_to_vm "$name" "$HOME/.config/opencode" "/home/$user/.config/opencode" 755 "$user" \
+    opencode.jsonc opencode.json
+
+  # OpenCode API key — {env:NEURALWATT_API_KEY} must resolve in the box
+  if [ -n "${NEURALWATT_API_KEY:-}" ]; then
+    local rc_tmp; rc_tmp="$(mktemp)"
+    printf '\n# >>> ai-sandbox opencode env\nexport NEURALWATT_API_KEY=%q\n# <<< ai-sandbox opencode env\n' "$NEURALWATT_API_KEY" >"$rc_tmp"
+    for rc_file in .bashrc .profile; do
+      vm_exec "$name" "sed -i '/^# >>> ai-sandbox opencode env\$/,/^# <<< ai-sandbox opencode env\$/d' /home/$user/$rc_file 2>/dev/null || true"
+      lxc file push -p "$rc_tmp" "$name/home/$user/${rc_file}.ai-sandbox-opencode-env"
+      vm_exec "$name" "cat /home/$user/${rc_file}.ai-sandbox-opencode-env >> /home/$user/$rc_file; rm -f /home/$user/${rc_file}.ai-sandbox-opencode-env; chown $user:$user /home/$user/$rc_file"
+    done
+    rm -f "$rc_tmp"
+  fi
 }
 
 ensure_box_ssh_key() {
-  local name="$1"
-  local user="$2"
+  local name="$1" user="$2"
   require_cmd ssh-keygen
   ensure_state_dirs
   local key_path="${SSH_KEY_DIR}/${name}_ed25519"
-  if [ ! -f "$key_path" ]; then
-    log "Generating per-box SSH key ${key_path}"
-    ssh-keygen -q -t ed25519 -N '' -C "ai-sandbox:${name}" -f "$key_path"
-  fi
-  chmod 600 "$key_path"
-  chmod 644 "${key_path}.pub"
+  [ -f "$key_path" ] || { log "Generating per-box SSH key ${key_path}"; ssh-keygen -q -t ed25519 -N '' -C "ai-sandbox:${name}" -f "$key_path"; }
+  chmod 600 "$key_path"; chmod 644 "${key_path}.pub"
   lxc file push "${key_path}.pub" "$name/tmp/ai-sandbox-authorized-key.pub"
-  lxc exec "$name" -- bash -lc "
-    set -e
+  vm_exec "$name" "
     install -d -m 700 -o '$user' -g '$user' '/home/$user/.ssh'
     touch '/home/$user/.ssh/authorized_keys'
     awk '
@@ -1008,797 +556,351 @@ ensure_box_ssh_key() {
       \$0 == \"# <<< ai-sandbox ${name}\" { skip=0; next }
       !skip { print }
     ' '/home/$user/.ssh/authorized_keys' > '/home/$user/.ssh/authorized_keys.tmp'
-    {
-      cat '/home/$user/.ssh/authorized_keys.tmp'
-      printf '%s\n' '# >>> ai-sandbox ${name}'
-      cat /tmp/ai-sandbox-authorized-key.pub
-      printf '%s\n' '# <<< ai-sandbox ${name}'
-    } > '/home/$user/.ssh/authorized_keys'
-    rm -f '/home/$user/.ssh/authorized_keys.tmp'
-    chown '$user:$user' '/home/$user/.ssh/authorized_keys'
-    chmod 600 '/home/$user/.ssh/authorized_keys'
-    rm -f /tmp/ai-sandbox-authorized-key.pub
+    { cat '/home/$user/.ssh/authorized_keys.tmp'; printf '# >>> ai-sandbox ${name}\n'; cat /tmp/ai-sandbox-authorized-key.pub; printf '# <<< ai-sandbox ${name}\n'; } > '/home/$user/.ssh/authorized_keys'
+    rm -f '/home/$user/.ssh/authorized_keys.tmp' /tmp/ai-sandbox-authorized-key.pub
+    chown '$user:$user' '/home/$user/.ssh/authorized_keys'; chmod 600 '/home/$user/.ssh/authorized_keys'
   "
 }
 
-github_state_granted() {
-  [ -n "${GITHUB_SSH_KEY_FINGERPRINT:-}" ]
-}
+run_install() { vm_exec "$1" "cd '$(repo_dir_for_user "$2")' && bash ./install.sh"; }
 
-github_key_title_for_box() {
-  printf 'sandbox-%s' "$1"
-}
+# ── GitHub SSH access ─────────────────────────────────────────────────────────
 
-require_github_auth() {
-  require_cmd gh
-  if ! gh auth status >/dev/null 2>&1; then
-    die "GitHub CLI is not authenticated on the host; run: gh auth login"
-  fi
-}
+github_state_granted() { [ -n "${GITHUB_SSH_KEY_FINGERPRINT:-}" ]; }
 
-ssh_key_fingerprint_from_file() {
-  ssh-keygen -lf "$1" -E sha256 | awk '{ print $2 }'
-}
-
-ensure_box_github_key() {
-  local name="$1"
-  local user="$2"
-  lxc exec "$name" -- runuser -u "$user" -- bash -lc "
-    set -euo pipefail
-    install -d -m 700 \"\$HOME/.ssh\"
-    if [ ! -f \"\$HOME/.ssh/id_ed25519\" ]; then
-      rm -f \"\$HOME/.ssh/id_ed25519.pub\"
-      ssh-keygen -q -t ed25519 -N '' -C '${name} sandbox github' -f \"\$HOME/.ssh/id_ed25519\"
-    fi
-    if [ ! -f \"\$HOME/.ssh/id_ed25519.pub\" ]; then
-      ssh-keygen -y -f \"\$HOME/.ssh/id_ed25519\" > \"\$HOME/.ssh/id_ed25519.pub\"
-    fi
-    chmod 700 \"\$HOME/.ssh\"
-    chmod 600 \"\$HOME/.ssh/id_ed25519\"
-    chmod 644 \"\$HOME/.ssh/id_ed25519.pub\"
-  "
-}
-
-box_github_public_key_to_file() {
-  local name="$1"
-  local user="$2"
-  local target="$3"
-  lxc exec "$name" -- runuser -u "$user" -- bash -lc 'cat "$HOME/.ssh/id_ed25519.pub"' >"$target"
-}
+ssh_key_fingerprint() { ssh-keygen -lf "$1" -E sha256 | awk '{print $2}'; }
 
 github_find_key_by_fingerprint() {
-  local wanted="$1"
-  FOUND_GITHUB_SSH_KEY_TITLE=""
-  FOUND_GITHUB_SSH_KEY_ID=""
-  local list_tmp err_tmp key_tmp
-  list_tmp="$(mktemp)"
-  err_tmp="$(mktemp)"
-  key_tmp="$(mktemp)"
-  if ! gh ssh-key list >"$list_tmp" 2>"$err_tmp"; then
-    local err
-    err="$(tr '\n' ' ' <"$err_tmp")"
-    rm -f "$list_tmp" "$err_tmp" "$key_tmp"
-    die "Could not list GitHub SSH keys: ${err}"
-  fi
-
-  local title key created id kind fp found=1
-  while IFS=$'\t' read -r title key created id kind; do
+  FOUND_GITHUB_SSH_KEY_TITLE=""; FOUND_GITHUB_SSH_KEY_ID=""
+  local list_tmp key_tmp title key id kind fp found=1
+  list_tmp="$(mktemp)"; key_tmp="$(mktemp)"
+  gh ssh-key list >"$list_tmp" 2>/dev/null || { rm -f "$list_tmp" "$key_tmp"; return 1; }
+  while IFS=$'\t' read -r title key _ id kind; do
     [ -n "${key:-}" ] || continue
     printf '%s\n' "$key" >"$key_tmp"
-    if fp="$(ssh_key_fingerprint_from_file "$key_tmp" 2>/dev/null)" && [ "$fp" = "$wanted" ]; then
-      FOUND_GITHUB_SSH_KEY_TITLE="$title"
-      FOUND_GITHUB_SSH_KEY_ID="$id"
-      found=0
-      break
+    if fp="$(ssh_key_fingerprint "$key_tmp" 2>/dev/null)" && [ "$fp" = "$1" ]; then
+      FOUND_GITHUB_SSH_KEY_TITLE="$title"; FOUND_GITHUB_SSH_KEY_ID="$id"; found=0; break
     fi
   done <"$list_tmp"
-
-  rm -f "$list_tmp" "$err_tmp" "$key_tmp"
+  rm -f "$list_tmp" "$key_tmp"
   return "$found"
-}
-
-host_git_email() {
-  local email=""
-  if command -v git >/dev/null 2>&1; then
-    email="$(git config user.email 2>/dev/null || true)"
-  fi
-  printf '%s' "${email:-fierywaters13@gmail.com}"
-}
-
-seed_box_github_known_hosts() {
-  local name="$1"
-  local user="$2"
-  lxc exec "$name" -- runuser -u "$user" -- bash -lc '
-    set -euo pipefail
-    install -d -m 700 "$HOME/.ssh"
-    touch "$HOME/.ssh/known_hosts"
-    ssh-keygen -R github.com -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
-    rm -f "$HOME/.ssh/known_hosts.old"
-    timeout 30 ssh-keyscan -t rsa,ecdsa,ed25519 github.com >>"$HOME/.ssh/known_hosts" 2>/dev/null
-    chmod 600 "$HOME/.ssh/known_hosts"
-  '
-}
-
-set_box_git_identity() {
-  local name="$1"
-  local user="$2"
-  local git_name="${name} sandbox"
-  local git_email
-  git_email="$(host_git_email)"
-  local quoted_name quoted_email
-  quoted_name="$(shell_quote "$git_name")"
-  quoted_email="$(shell_quote "$git_email")"
-  lxc exec "$name" -- runuser -u "$user" -- bash -lc "
-    set -euo pipefail
-    git config --global user.name $quoted_name
-    git config --global user.email $quoted_email
-  "
-}
-
-record_github_state() {
-  local name="$1"
-  local title="$2"
-  local fingerprint="$3"
-  local key_id="${4:-}"
-  load_box_env "$name" || die "No box.env found; run update first"
-  GITHUB_SSH_KEY_TITLE="$title"
-  GITHUB_SSH_KEY_FINGERPRINT="$fingerprint"
-  GITHUB_SSH_KEY_ID="$key_id"
-  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" "$MEMORY_LIMIT"
-}
-
-clear_github_state() {
-  local name="$1"
-  load_box_env "$name" || die "No box.env found; run update first"
-  GITHUB_SSH_KEY_TITLE=""
-  GITHUB_SSH_KEY_FINGERPRINT=""
-  GITHUB_SSH_KEY_ID=""
-  write_host_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" "$MEMORY_LIMIT"
 }
 
 github_grant() {
   local name="$1"
-  require_cmd lxc
-  require_cmd ssh-keygen
-  require_github_auth
-  instance_exists "$name" || die "LXD instance not found: ${name}"
-  start_instance "$name"
-  wait_for_lxc "$name"
+  require_cmd gh
+  gh auth status >/dev/null 2>&1 || die "GitHub CLI not authenticated; run: gh auth login"
+  instance_exists "$name" || die "LXD instance not found: $name"
+  start_instance "$name"; wait_for_lxc "$name"
   load_box_env "$name" || die "No box.env found; run update first"
 
-  ensure_box_github_key "$name" "$SANDBOX_USER"
+  # Generate keypair inside the box if needed
+  vm_user "$name" "$SANDBOX_USER" '
+    install -d -m 700 "$HOME/.ssh"
+    [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -C "'"$name"' sandbox github" -f "$HOME/.ssh/id_ed25519"
+    [ -f "$HOME/.ssh/id_ed25519.pub" ] || ssh-keygen -y -f "$HOME/.ssh/id_ed25519" > "$HOME/.ssh/id_ed25519.pub"
+    chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/id_ed25519"; chmod 644 "$HOME/.ssh/id_ed25519.pub"
+  '
 
-  local public_key_file
-  public_key_file="$(mktemp)"
-  box_github_public_key_to_file "$name" "$SANDBOX_USER" "$public_key_file"
+  local public_key_file; public_key_file="$(mktemp)"
+  vm_user "$name" "$SANDBOX_USER" 'cat "$HOME/.ssh/id_ed25519.pub"' >"$public_key_file"
   local fingerprint title key_id
-  fingerprint="$(ssh_key_fingerprint_from_file "$public_key_file")"
+  fingerprint="$(ssh_key_fingerprint "$public_key_file")"
 
   if github_find_key_by_fingerprint "$fingerprint"; then
-    title="$FOUND_GITHUB_SSH_KEY_TITLE"
-    key_id="$FOUND_GITHUB_SSH_KEY_ID"
-    log "GitHub SSH key ${fingerprint} is already registered as ${title}; skipping add"
+    title="$FOUND_GITHUB_SSH_KEY_TITLE"; key_id="$FOUND_GITHUB_SSH_KEY_ID"
+    log "GitHub SSH key ${fingerprint} already registered as ${title}; skipping add"
   else
-    title="$(github_key_title_for_box "$name")"
+    title="sandbox-${name}"
     log "Adding GitHub SSH key ${fingerprint} as ${title}"
     gh ssh-key add "$public_key_file" --title "$title" >/dev/null
-    key_id=""
-    if github_find_key_by_fingerprint "$fingerprint"; then
-      title="${FOUND_GITHUB_SSH_KEY_TITLE:-$title}"
-      key_id="$FOUND_GITHUB_SSH_KEY_ID"
-    fi
+    github_find_key_by_fingerprint "$fingerprint" && key_id="$FOUND_GITHUB_SSH_KEY_ID"
   fi
-
-  seed_box_github_known_hosts "$name" "$SANDBOX_USER"
-  set_box_git_identity "$name" "$SANDBOX_USER"
-  record_github_state "$name" "$title" "$fingerprint" "$key_id"
   rm -f "$public_key_file"
+
+  # Seed known_hosts + set git identity
+  vm_user "$name" "$SANDBOX_USER" '
+    install -d -m 700 "$HOME/.ssh"; touch "$HOME/.ssh/known_hosts"
+    ssh-keygen -R github.com -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
+    timeout 30 ssh-keyscan -t rsa,ecdsa,ed25519 github.com >>"$HOME/.ssh/known_hosts" 2>/dev/null
+    chmod 600 "$HOME/.ssh/known_hosts"
+  '
+  local email; email="$(git config user.email 2>/dev/null || printf 'fierywaters13@gmail.com')"
+  vm_user "$name" "$SANDBOX_USER" "git config --global user.name '${name} sandbox'; git config --global user.email '${email}'"
+
+  GITHUB_SSH_KEY_TITLE="$title"; GITHUB_SSH_KEY_FINGERPRINT="$fingerprint"; GITHUB_SSH_KEY_ID="$key_id"
+  write_host_env "$name"
   log "GitHub access granted for ${name}"
 }
 
 github_revoke() {
   local name="$1"
-  require_cmd ssh-keygen
-  require_github_auth
-  if ! load_box_env "$name"; then
-    warn "No host box state found for ${name}; nothing to revoke"
-    return
-  fi
-  if ! github_state_granted; then
-    warn "No GitHub SSH key recorded for ${name}; nothing to revoke"
-    return
-  fi
-
-  local fingerprint="$GITHUB_SSH_KEY_FINGERPRINT"
-  local title="$GITHUB_SSH_KEY_TITLE"
-  if github_find_key_by_fingerprint "$fingerprint"; then
-    if [ -z "$FOUND_GITHUB_SSH_KEY_ID" ]; then
-      die "Could not determine GitHub SSH key id for ${fingerprint}"
-    fi
-    log "Revoking GitHub SSH key ${fingerprint} (${title})"
+  require_cmd gh
+  gh auth status >/dev/null 2>&1 || die "GitHub CLI not authenticated"
+  if ! load_box_env "$name"; then warn "No box state for $name"; return; fi
+  github_state_granted || { warn "No GitHub SSH key recorded for $name"; return; }
+  if github_find_key_by_fingerprint "$GITHUB_SSH_KEY_FINGERPRINT"; then
+    [ -n "$FOUND_GITHUB_SSH_KEY_ID" ] || die "Could not determine GitHub SSH key id for $GITHUB_SSH_KEY_FINGERPRINT"
+    log "Revoking GitHub SSH key $GITHUB_SSH_KEY_FINGERPRINT ($GITHUB_SSH_KEY_TITLE)"
     gh ssh-key delete "$FOUND_GITHUB_SSH_KEY_ID" --yes >/dev/null
   else
-    warn "GitHub SSH key ${fingerprint} (${title}) is already gone"
+    warn "GitHub SSH key $GITHUB_SSH_KEY_FINGERPRINT ($GITHUB_SSH_KEY_TITLE) is already gone"
   fi
-
-  clear_github_state "$name"
+  GITHUB_SSH_KEY_TITLE=""; GITHUB_SSH_KEY_FINGERPRINT=""; GITHUB_SSH_KEY_ID=""
+  write_host_env "$name"
   log "GitHub access revoked for ${name}"
 }
 
-sync_host_codex_profile() {
-  local name="$1"
-  local user="$2"
-  local source="${HOME}/.codex"
-  [ -d "$source" ] || return
-  local items=()
-  local rel
-  for rel in auth.json config.toml AGENTS.md AGENTS.override.md hooks.json hooks rules memories skills; do
-    [ -e "$source/$rel" ] && items+=("$rel")
-  done
-  [ "${#items[@]}" -gt 0 ] || return
-  log "Importing host Codex profile files for ${user}"
-  lxc exec "$name" -- bash -lc "install -d -m 700 -o '$user' -g '$user' '/home/$user/.codex'"
-  tar -C "$source" -cf - "${items[@]}" \
-    | lxc exec "$name" -- tar -C "/home/$user/.codex" -xf -
-  lxc exec "$name" -- bash -lc "
-    chown -R '$user:$user' '/home/$user/.codex'
-    chmod 700 '/home/$user/.codex'
-    [ ! -f '/home/$user/.codex/auth.json' ] || chmod 600 '/home/$user/.codex/auth.json'
-    [ ! -f '/home/$user/.codex/config.toml' ] || chmod 600 '/home/$user/.codex/config.toml'
-    find '/home/$user/.codex/hooks' -type f -exec chmod 755 {} + 2>/dev/null || true
-  "
-}
+# ── Health checks ─────────────────────────────────────────────────────────────
 
-sync_host_claude_profile() {
-  local name="$1"
-  local user="$2"
-  local source="${HOME}/.claude"
-  [ -d "$source" ] || return 0
-  local items=()
-  local rel
-  for rel in .credentials.json settings.json CLAUDE.md agents skills; do
-    [ -e "$source/$rel" ] && items+=("$rel")
-  done
-  if [ "${#items[@]}" -gt 0 ]; then
-    log "Importing host Claude profile files for ${user}"
-    lxc exec "$name" -- bash -lc "install -d -m 700 -o '$user' -g '$user' '/home/$user/.claude'"
-    tar -C "$source" -cf - "${items[@]}" \
-      | lxc exec "$name" -- tar -C "/home/$user/.claude" -xf -
-  fi
-
-  # ~/.claude.json carries onboarding/account state. Build a minimal one so
-  # Claude in the box is signed in and non-interactive, without inheriting
-  # host project history.
-  if [ -f "${HOME}/.claude.json" ] && command -v jq >/dev/null 2>&1; then
-    jq '{hasCompletedOnboarding: true, bypassPermissionsModeAccepted: true}
-        + (if .oauthAccount then {oauthAccount: .oauthAccount} else {} end)' \
-      "${HOME}/.claude.json" \
-      | lxc exec "$name" -- bash -lc "cat > '/home/$user/.claude.json'"
-  fi
-  lxc exec "$name" -- bash -lc "
-    chown -R '$user:$user' '/home/$user/.claude'
-    chmod 700 '/home/$user/.claude'
-    [ ! -f '/home/$user/.claude/.credentials.json' ] || chmod 600 '/home/$user/.claude/.credentials.json'
-    [ ! -f '/home/$user/.claude.json' ] || chown '$user:$user' '/home/$user/.claude.json'
-  "
-}
-
-sync_host_opencode_profile() {
-  local name="$1"
-  local user="$2"
-  local source="${HOME}/.config/opencode"
-  [ -d "$source" ] || return 0
-
-  log "Importing host OpenCode config for ${user}"
-  lxc exec "$name" -- bash -lc "install -d -m 755 -o '$user' -g '$user' '/home/$user/.config/opencode'"
-  tar -C "$source" -cf - opencode.jsonc opencode.json \
-    2>/dev/null | lxc exec "$name" -- tar -C "/home/$user/.config/opencode" -xf - 2>/dev/null || true
-  lxc exec "$name" -- bash -lc "chown -R '$user:$user' '/home/$user/.config/opencode' 2>/dev/null || true"
-
-  # Sync the API key into the box's bashrc so {env:NEURALWATT_API_KEY} resolves.
-  local api_key="${NEURALWATT_API_KEY:-}"
-  if [ -n "$api_key" ]; then
-    local rc_tmp
-    rc_tmp="$(mktemp)"
-    printf '\n# >>> ai-sandbox opencode env\nexport NEURALWATT_API_KEY=%q\n# <<< ai-sandbox opencode env\n' "$api_key" >"$rc_tmp"
-    for rc_file in ".bashrc" ".profile"; do
-      lxc exec "$name" -- bash -lc "sed -i '/^# >>> ai-sandbox opencode env\$/,/^# <<< ai-sandbox opencode env\$/d' '/home/$user/$rc_file' 2>/dev/null || true"
-      lxc file push -p "$rc_tmp" "$name/home/$user/$rc_file.ai-sandbox-opencode-env"
-      lxc exec "$name" -- bash -lc "cat '/home/$user/$rc_file.ai-sandbox-opencode-env' >> '/home/$user/$rc_file'; rm -f '/home/$user/$rc_file.ai-sandbox-opencode-env'; chown '$user:$user' '/home/$user/$rc_file'"
-    done
-    rm -f "$rc_tmp"
-  fi
-}
-
-run_install() {
-  local name="$1"
-  local user="$2"
-  local repo_dir
-  repo_dir="$(repo_dir_for_user "$user")"
-  lxc exec "$name" -- bash -lc "cd '$repo_dir' && bash ./install.sh"
-}
-
-remove_managed_ssh_block() {
-  local name="$1"
-  remove_managed_ssh_block_from_file "$SSH_CONFIG" "$name"
-  remove_managed_ssh_block_from_file "$SSH_MANAGED_CONFIG" "$name"
-}
-
-managed_host_alias() {
-  printf 'ai-sandbox-%s' "$1"
-}
-
-remove_managed_known_host() {
-  local name="$1"
-  local host_alias
-  host_alias="$(managed_host_alias "$name")"
-  ensure_state_dirs
-  [ -f "$SSH_KNOWN_HOSTS" ] || return
-  ssh-keygen -f "$SSH_KNOWN_HOSTS" -R "$host_alias" >/dev/null 2>&1 || true
-}
-
-ssh_host_exists_unmanaged() {
-  local name="$1"
-  [ -f "$SSH_CONFIG" ] || return 1
-  awk -v name="$name" '
-    $0 == "# >>> ai-sandbox " name { managed=1 }
-    $0 == "# <<< ai-sandbox " name { managed=0; next }
-    managed { next }
-    /^[[:space:]]*Host[[:space:]]+/ {
-      for (i=2; i<=NF; i++) if ($i == name) found=1
-    }
-    END { exit found ? 0 : 1 }
-  ' "$SSH_CONFIG"
-}
-
-write_ssh_config() {
-  local name="$1"
-  local user="$2"
-  local port="$3"
-  local key_path="${SSH_KEY_DIR}/${name}_ed25519"
-  local host_alias
-  host_alias="$(managed_host_alias "$name")"
-  ensure_ssh_include
-  touch "$SSH_KNOWN_HOSTS"
-  chmod 600 "$SSH_KNOWN_HOSTS"
-  remove_managed_ssh_block "$name"
-  if ssh_host_exists_unmanaged "$name"; then
-    die "~/.ssh/config already has unmanaged Host ${name}; refusing to edit it"
-  fi
-  {
-    printf '\n# >>> ai-sandbox %s\n' "$name"
-    printf 'Host %s\n' "$name"
-    printf '  HostName 127.0.0.1\n'
-    printf '  User %s\n' "$user"
-    printf '  Port %s\n' "$port"
-    printf '  IdentityFile %s\n' "$key_path"
-    printf '  IdentitiesOnly yes\n'
-    printf '  UserKnownHostsFile %s\n' "$SSH_KNOWN_HOSTS"
-    printf '  HostKeyAlias %s\n' "$host_alias"
-    printf '  StrictHostKeyChecking accept-new\n'
-    printf '# <<< ai-sandbox %s\n' "$name"
-  } >>"$SSH_MANAGED_CONFIG"
-}
-
-tcp_check() {
-  local port="$1"
-  timeout 5 bash -c "</dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1
-}
+tcp_check() { timeout 5 bash -c "</dev/tcp/127.0.0.1/$1" >/dev/null 2>&1; }
 
 ssh_hostname_matches() {
-  local name="$1"
   local actual
-  actual="$(timeout 8 ssh \
-    -o BatchMode=yes \
-    -o ConnectTimeout=5 \
-    -o ConnectionAttempts=1 \
-    "$name" hostname)" || return
-  if [ "$actual" != "$name" ]; then
-    printf 'Expected SSH hostname %s, got %s\n' "$name" "$actual" >&2
-    return 1
-  fi
+  actual="$(timeout 8 ssh -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 "$1" hostname)" || return
+  [ "$actual" = "$1" ] || { printf 'Expected %s, got %s\n' "$1" "$actual" >&2; return 1; }
 }
 
 doctor() {
-  local name="$1"
-  local failures=0
-  local label
-  local -a passed_checks=()
-  local -a failed_checks=()
-  local -a skipped_checks=()
-  check_doctor() {
-    label="$1"
-    shift
+  local name="$1" failures=0 warnings=0
+  local vm_doctor; vm_doctor="$(repo_dir_for_user "$SANDBOX_USER")/vm/doctor"
+
+  # Critical check — failure means the box is broken
+  dr() {
+    local label="$1"; shift
     printf '[doctor] %-32s' "$label"
-    if "$@" >/tmp/ai-sandbox-doctor.out 2>/tmp/ai-sandbox-doctor.err; then
-      printf ' ok\n'
-      passed_checks+=("$label")
-      return 0
+    if "$@" >/tmp/dr.out 2>/tmp/dr.err; then
+      printf ' ok\n'; return 0
     else
-      printf ' FAIL\n' >&2
-      sed 's/^/[doctor][stderr] /' /tmp/ai-sandbox-doctor.err >&2 || true
-      failed_checks+=("$label")
-      failures=$((failures + 1))
-      return 1
+      printf ' FAIL\n' >&2; sed 's/^/[doctor] /' /tmp/dr.err >&2 || true
+      failures=$((failures + 1)); return 1
     fi
   }
-  skip_doctor() {
-    label="$1"
-    shift
-    printf '[doctor] %-32s skipped (%s)\n' "$label" "$*"
-    skipped_checks+=("$label")
+  # Warning check — failure means a feature is degraded, not broken
+  dr_warn() {
+    local label="$1"; shift
+    printf '[doctor] %-32s' "$label"
+    if "$@" >/tmp/dr.out 2>/tmp/dr.err; then
+      printf ' ok\n'; return 0
+    else
+      printf ' warn\n' >&2; sed 's/^/[doctor] /' /tmp/dr.err >&2 || true
+      warnings=$((warnings + 1)); return 1
+    fi
   }
-  retry_doctor() {
-    # 90s window: right after create/update the desktop services have just
-    # been (re)started, and a cold vncserver+XFCE start can exceed 30s. The
-    # host proxy ports accept instantly, so the HTTP checks are the real
-    # "service is up" gate and need the headroom.
-    local attempt
-    for attempt in $(seq 1 90); do
-      if "$@"; then
-        return 0
-      fi
-      sleep 1
-    done
-    "$@"
-  }
+  # 90s retry window — cold vncserver+XFCE start can exceed 30s
+  retry() { for _ in $(seq 1 90); do "$@" && return 0; sleep 1; done; "$@"; }
 
-  # Run every check even if earlier ones fail, so the user sees a complete
-  # picture in one pass instead of fixing failures one at a time.
-  set +e
+  set +e  # run all checks even on failure
 
-  check_doctor "LXD instance" lxc_query info "$name"
+  # ── Critical: every later check runs through this LXD instance ──
+  dr "LXD instance" lxc_query info "$name"
   if load_instance_status "$name" && instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then
     printf '[doctor] %-32s FAIL\n' "LXD split-brain" >&2
-    printf '[doctor][stderr] LXD reports ERROR while a container monitor is still live; disable autostart and recover LXD before update/start.\n' >&2
-    failed_checks+=("LXD split-brain")
     failures=$((failures + 1))
   fi
+
+  # ── Warnings: each failure is reported without hiding the remaining checks ──
+  dr_warn "SSH port ${SSH_PORT}"     retry tcp_check "$SSH_PORT"
+  dr_warn "noVNC port ${NOVNC_PORT}" retry tcp_check "$NOVNC_PORT"
+  dr_warn "ssh ${name} hostname"     ssh_hostname_matches "$name"
+  dr_warn "noVNC HTTP" retry curl -fsS "http://127.0.0.1:${NOVNC_PORT}/"
+  dr_warn "VM deskbot" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc \
+    'command -v deskbot && deskbot --help | grep -q -- "--screenshot"'
+  dr_warn "VM deskbot visual pixels" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
+    cd \"\$HOME\"; image=/tmp/ai-sandbox-deskbot.jpg; profile=/tmp/ai-sandbox-deskbot-profile
+    url='data:text/html,%3C!doctype%20html%3E%3Ctitle%3Eai-sandbox%3C/title%3E%3Cbody%20style%3D%22margin%3A0%3Bbackground%3A%23ff00ff%3Bcolor%3Awhite%3Bfont%3A48px%20sans-serif%22%3EAI%20Sandbox%20Deskbot%20Doctor%3C/body%3E'
+    rm -rf \"\$profile\" \"\$image\"; deskbot --reset
+    deskbot --bash \"CHROMIUM_USER_DATA_DIR=\\\"\$profile\\\" chromium --new-window '\$url' >/tmp/deskbot-chromium.log 2>&1 & sleep 6; wmctrl -a ai-sandbox 2>/dev/null || true; wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz 2>/dev/null || true; deskbot --screenshot '\$image'\"
+    python3 '${vm_doctor}/check_pixels.py' \"\$image\"
+  "
+  dr_warn "CUA port ${CUA_PORT}" retry tcp_check "$CUA_PORT"
+  dr_warn "CUA status" retry curl -fsS "http://127.0.0.1:${CUA_PORT}/status"
   if [ -n "${MEMORY_LIMIT:-}" ]; then
-    check_doctor "Memory cap ${MEMORY_LIMIT}" memory_limit_matches "$name" "$MEMORY_LIMIT"
+    dr_warn "Memory cap ${MEMORY_LIMIT}" memory_limit_matches "$name" "$MEMORY_LIMIT"
   else
     load_lxd_memory_limit "$name"
     printf '[doctor] %-32s unrecorded (actual: %s)\n' "Memory cap" "${LXD_MEMORY_LIMIT:-none}"
   fi
-  check_doctor "SSH port ${SSH_PORT}" retry_doctor tcp_check "$SSH_PORT"
-  check_doctor "noVNC port ${NOVNC_PORT}" retry_doctor tcp_check "$NOVNC_PORT"
-  check_doctor "CUA port ${CUA_PORT}" retry_doctor tcp_check "$CUA_PORT"
-  check_doctor "ssh ${name} hostname" ssh_hostname_matches "$name"
+
+  # ── Optional: agent CLIs and GitHub depend on the user's credentials ──
+  # Missing credentials are skipped; credentials that do not work are warnings.
+  has_credentials() { lxc exec "$name" -- test -s "/home/$SANDBOX_USER/$1"; }
+  if has_credentials .codex/auth.json; then
+    dr_warn "VM Codex login" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc \
+      'codex login status 2>&1 | grep -q "Logged in"' &&
+    dr_warn "VM Codex deskbot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
+      cd \"\$HOME\"; trace=/tmp/ai-sandbox-codex-deskbot-trace.jsonl; image=/tmp/ai-sandbox-codex-deskbot.jpg; rm -f \"\$image\"
+      printf '%s\n' '<!doctype html>' '<title>ai-sandbox-codex</title>' '<body style=\"margin:0;background:#ff00ff;color:white;font:48px sans-serif\">AI Sandbox Codex Deskbot</body>' >/tmp/ai-sandbox-codex-deskbot.html
+      prompt='Read ~/.codex/skills/deskbot/SKILL.md if present. Then run one shell command execution that resets stale Chromium windows, opens file:///tmp/ai-sandbox-codex-deskbot.html in Chromium with CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-codex-deskbot-profile, waits at least 6 seconds, and takes a screenshot exactly at /tmp/ai-sandbox-codex-deskbot.jpg. Do not split the launch and screenshot into separate command executions. The command should be equivalent to: deskbot --reset && deskbot --bash \"rm -rf /tmp/ai-sandbox-codex-deskbot-profile; CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-codex-deskbot-profile chromium --new-window file:///tmp/ai-sandbox-codex-deskbot.html >/tmp/deskbot-chromium.log 2>&1 & sleep 6; wmctrl -a ai-sandbox-codex 2>/dev/null || true; deskbot --screenshot /tmp/ai-sandbox-codex-deskbot.jpg\". Do not edit files.'
+      timeout 600 codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \"\$prompt\" </dev/null >\"\$trace\" 2>&1 || { tail -n 50 \"\$trace\" >&2; exit 1; }
+      python3 '${vm_doctor}/check_agent_trace.py' \"\$trace\" /tmp/ai-sandbox-codex-deskbot-commands.json || { tail -n 50 \"\$trace\" >&2; exit 1; }
+      python3 '${vm_doctor}/check_pixels.py' \"\$image\" || { ls -l \"\$image\" >&2 2>/dev/null || printf 'no screenshot produced\n' >&2; exit 1; }
+    "
+  else
+    printf '[doctor] %-32s skipped (no credentials)\n' "VM Codex"
+  fi
+  if has_credentials .claude/.credentials.json; then
+    dr_warn "VM Claude auth" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc \
+      'cd "$HOME"; test -s "$HOME/.claude/.credentials.json"; out=$(timeout 120 claude -p --model sonnet --dangerously-skip-permissions -- "Reply with exactly: ok" </dev/null 2>&1) && echo "$out" | grep -qi "ok"' &&
+    dr_warn "VM Claude deskbot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
+      cd \"\$HOME\"; image=/tmp/ai-sandbox-claude-deskbot.jpg; rm -f \"\$image\"
+      printf '%s\n' '<!doctype html>' '<title>ai-sandbox-claude</title>' '<body style=\"margin:0;background:#ff00ff;color:white;font:48px sans-serif\">AI Sandbox Claude Deskbot</body>' >/tmp/ai-sandbox-claude-deskbot.html
+      prompt='Read ~/.claude/skills/deskbot/SKILL.md if present. Then run one Bash command that resets stale Chromium windows, opens file:///tmp/ai-sandbox-claude-deskbot.html in Chromium with CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-claude-deskbot-profile, waits at least 6 seconds, and takes a screenshot exactly at /tmp/ai-sandbox-claude-deskbot.jpg. Use deskbot only; do not use ffmpeg, xdotool, or HTTP APIs. The command should be equivalent to: deskbot --reset && deskbot --bash \"rm -rf /tmp/ai-sandbox-claude-deskbot-profile; CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-claude-deskbot-profile chromium --new-window file:///tmp/ai-sandbox-claude-deskbot.html >/tmp/deskbot-chromium.log 2>&1 & sleep 6; wmctrl -a ai-sandbox-claude 2>/dev/null || true; deskbot --screenshot /tmp/ai-sandbox-claude-deskbot.jpg\". Do not edit files.'
+      timeout 600 claude -p --model sonnet --dangerously-skip-permissions --allowedTools Bash -- \"\$prompt\" </dev/null >/tmp/ai-sandbox-claude-deskbot.out 2>&1 || { tail -n 50 /tmp/ai-sandbox-claude-deskbot.out >&2; exit 1; }
+      python3 '${vm_doctor}/check_pixels.py' \"\$image\" || { ls -l \"\$image\" >&2 2>/dev/null || printf 'no screenshot produced\n' >&2; exit 1; }
+    "
+  else
+    printf '[doctor] %-32s skipped (no credentials)\n' "VM Claude"
+  fi
   if github_state_granted; then
     printf '[doctor] %-32s granted (%s)\n' "GitHub access" "$GITHUB_SSH_KEY_FINGERPRINT"
-    check_doctor "GitHub SSH auth" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
-      set -euo pipefail
-      status=0
-      out="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1)" || status=$?
-      if [ "$status" -ne 1 ]; then
-        printf "%s\n" "$out" >&2
-        exit 1
-      fi
-      if ! printf "%s\n" "$out" | grep -qi "successfully authenticated"; then
-        printf "%s\n" "$out" >&2
-        exit 1
-      fi
-    '
+    dr_warn "GitHub SSH auth" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc \
+      'status=0; out="$(ssh -o BatchMode=yes -T git@github.com 2>&1)" || status=$?; [ "$status" = 1 ] && echo "$out" | grep -qi "successfully authenticated"'
   else
     printf '[doctor] %-32s not granted\n' "GitHub access"
   fi
-  check_doctor "noVNC HTTP" retry_doctor curl -fsS "http://127.0.0.1:${NOVNC_PORT}/"
-  check_doctor "CUA status" retry_doctor curl -fsS "http://127.0.0.1:${CUA_PORT}/status"
-  # Doctor's validation scripts run from the checkout that sync_repo_to_vm
-  # already placed inside the box, so the code that runs is the code in vm/.
-  local vm_doctor
-  vm_doctor="$(repo_dir_for_user "$SANDBOX_USER")/vm/doctor"
-
-  check_doctor "VM Codex login" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "codex login status 2>&1 | grep -q 'Logged in'"
-  local claude_auth_ok=0
-  if check_doctor "VM Claude auth" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
-    set -euo pipefail
-    cd "$HOME"
-    test -s "$HOME/.claude/.credentials.json"
-    out="$(timeout 120 claude -p --model sonnet --dangerously-skip-permissions -- "Reply with exactly: ok" </dev/null 2>&1)" || {
-      printf "%s\n" "$out" >&2
-      exit 1
-    }
-    printf "%s\n" "$out" | grep -qi "ok" || {
-      printf "%s\n" "$out" >&2
-      exit 1
-    }
-  '; then
-    claude_auth_ok=1
-  fi
-  check_doctor "VM deskbot" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc '
-    set -euo pipefail
-    command -v deskbot >/dev/null
-    deskbot --help | grep -q -- "--screenshot"
-  '
-  check_doctor "VM deskbot visual pixels" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
-    set -euo pipefail
-    cd \"\$HOME\"
-    image=/tmp/ai-sandbox-deskbot.jpg
-    profile=/tmp/ai-sandbox-deskbot-profile
-    url='data:text/html,%3C!doctype%20html%3E%3Ctitle%3Eai-sandbox%3C/title%3E%3Cbody%20style%3D%22margin%3A0%3Bbackground%3A%23ff00ff%3Bcolor%3Awhite%3Bfont%3A48px%20sans-serif%22%3EAI%20Sandbox%20Deskbot%20Doctor%3C/body%3E'
-    rm -rf \"\$profile\" \"\$image\"
-    deskbot --reset >/tmp/ai-sandbox-deskbot-reset.out
-    deskbot --bash \"CHROMIUM_USER_DATA_DIR=\\\"\$profile\\\" chromium --new-window '\$url' >/tmp/ai-sandbox-deskbot-chromium.log 2>&1 & sleep 6; wmctrl -a ai-sandbox 2>/dev/null || true; wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz 2>/dev/null || true; deskbot --screenshot '\$image'\" >/tmp/ai-sandbox-deskbot-screenshot.out
-    python3 '${vm_doctor}/check_pixels.py' \"\$image\"
-  "
-  check_doctor "VM Codex deskbot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
-    set -euo pipefail
-    cd \"\$HOME\"
-    trace=/tmp/ai-sandbox-codex-deskbot-trace.jsonl
-    image=/tmp/ai-sandbox-codex-deskbot.jpg
-    rm -f \"\$image\"
-    printf '%s\n' '<!doctype html>' '<title>ai-sandbox-codex</title>' '<body style=\"margin:0;background:#ff00ff;color:white;font:48px sans-serif\">AI Sandbox Codex Deskbot Doctor</body>' >/tmp/ai-sandbox-codex-deskbot.html
-    # codex exec may clean up background child processes between separate
-    # command executions. Keep browser launch, paint wait, and screenshot in
-    # one command execution so the browser is alive when pixels are captured.
-    prompt='Read ~/.codex/skills/deskbot/SKILL.md if present. Then run one shell command execution that resets stale Chromium windows, opens file:///tmp/ai-sandbox-codex-deskbot.html in Chromium with CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-codex-deskbot-profile, waits at least 6 seconds for the page to paint, and takes a screenshot exactly at /tmp/ai-sandbox-codex-deskbot.jpg. Do not split the launch and screenshot into separate command executions. The command should be equivalent to: deskbot --reset && deskbot --bash \"rm -rf /tmp/ai-sandbox-codex-deskbot-profile; CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-codex-deskbot-profile chromium --new-window file:///tmp/ai-sandbox-codex-deskbot.html >/tmp/deskbot-chromium.log 2>&1 & sleep 6; wmctrl -a ai-sandbox-codex 2>/dev/null || true; deskbot --screenshot /tmp/ai-sandbox-codex-deskbot.jpg\". Do not edit files.'
-    timeout 600 codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \"\$prompt\" </dev/null >\"\$trace\" 2>&1 || {
-      tail -n 50 \"\$trace\" >&2 || true
-      exit 1
-    }
-    python3 '${vm_doctor}/check_agent_trace.py' \"\$trace\" /tmp/ai-sandbox-codex-deskbot-commands.json || {
-      tail -n 50 \"\$trace\" >&2 || true
-      exit 1
-    }
-    python3 '${vm_doctor}/check_pixels.py' \"\$image\" || {
-      ls -l \"\$image\" >&2 2>/dev/null || echo \"no screenshot produced\" >&2
-      exit 1
-    }
-  "
-  if [ "$claude_auth_ok" -eq 1 ]; then
-    check_doctor "VM Claude deskbot smoke" lxc exec "$name" -- runuser -u "$SANDBOX_USER" -- bash -lc "
-      set -euo pipefail
-      cd \"\$HOME\"
-      image=/tmp/ai-sandbox-claude-deskbot.jpg
-      rm -f \"\$image\"
-      printf '%s\n' '<!doctype html>' '<title>ai-sandbox-claude</title>' '<body style=\"margin:0;background:#ff00ff;color:white;font:48px sans-serif\">AI Sandbox Claude Deskbot Doctor</body>' >/tmp/ai-sandbox-claude-deskbot.html
-      prompt='Read ~/.claude/skills/deskbot/SKILL.md if present. Then run one Bash command that resets stale Chromium windows, opens file:///tmp/ai-sandbox-claude-deskbot.html in Chromium with CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-claude-deskbot-profile, waits at least 6 seconds for the page to paint, and takes a screenshot exactly at /tmp/ai-sandbox-claude-deskbot.jpg. Use deskbot only; do not use ffmpeg, xdotool, or HTTP APIs. The command should be equivalent to: deskbot --reset && deskbot --bash \"rm -rf /tmp/ai-sandbox-claude-deskbot-profile; CHROMIUM_USER_DATA_DIR=/tmp/ai-sandbox-claude-deskbot-profile chromium --new-window file:///tmp/ai-sandbox-claude-deskbot.html >/tmp/deskbot-chromium.log 2>&1 & sleep 6; wmctrl -a ai-sandbox-claude 2>/dev/null || true; deskbot --screenshot /tmp/ai-sandbox-claude-deskbot.jpg\". Do not edit files.'
-      timeout 600 claude -p --model sonnet --dangerously-skip-permissions --allowedTools Bash -- \"\$prompt\" </dev/null >/tmp/ai-sandbox-claude-deskbot.out 2>&1 || {
-        tail -n 50 /tmp/ai-sandbox-claude-deskbot.out >&2 || true
-        exit 1
-      }
-      python3 '${vm_doctor}/check_pixels.py' \"\$image\" || {
-        ls -l \"\$image\" >&2 2>/dev/null || echo \"no screenshot produced\" >&2
-        exit 1
-      }
-    "
-  else
-    skip_doctor "VM Claude deskbot smoke" "Claude auth failed"
-  fi
 
   set -e
-
-  printf '\n[doctor] Checklist for %s:\n' "$name"
-  local check
-  for check in "${passed_checks[@]}"; do
-    printf '  [x] %s\n' "$check"
-  done
-  for check in "${failed_checks[@]}"; do
-    printf '  [ ] %s\n' "$check"
-  done
-  for check in "${skipped_checks[@]}"; do
-    printf '  [-] %s\n' "$check"
-  done
-  printf '[doctor] %d passed, %d failed, %d skipped\n' \
-    "${#passed_checks[@]}" "${#failed_checks[@]}" "${#skipped_checks[@]}"
-
-  rm -f /tmp/ai-sandbox-doctor.out /tmp/ai-sandbox-doctor.err
-  [ "$failures" -eq 0 ] || die "${failures} doctor check(s) failed"
+  rm -f /tmp/dr.out /tmp/dr.err
+  printf '[doctor] %d failed, %d warning(s) for %s\n' "$failures" "$warnings" "$name"
+  [ "$failures" -eq 0 ] || die "${failures} critical doctor check(s) failed"
 }
 
-require_stopped_instance() {
-  local name="$1"
-  load_instance_status "$name" || die "Could not read LXD status for ${name}"
-  [ "$INSTANCE_STATUS" = "STOPPED" ] || die "${name} must be stopped first; run: sandbox stop ${name}"
+# ── Shared pipeline: apply managed state to a running box ────────────────────
+# Called by create (fresh), update, and clone paths.
+# $1=name $2=user $3=port_base $4=ssh_bind $5=novnc_bind $6=cua_bind
+# $7=memory_limit $8=vnc_password $9=reassign_if_busy $10=mode(fresh|update|clone)
+apply_managed_box_state() {
+  local name="$1" user="$2" port_base="$3" ssh_bind="$4" novnc_bind="$5" cua_bind="$6"
+  local memory_limit="$7" vnc_password="$8" reassign_if_busy="${9:-no}" mode="${10:-update}"
+
+  ports_from_base "$port_base"
+  VNC_PASSWORD="$vnc_password"
+  ensure_user "$name" "$user"
+  configure_base_lxd "$name"
+  apply_memory_limit "$name" "$memory_limit"
+  write_box_env "$name" "$user" "$port_base" "$vnc_password" "$ssh_bind" "$novnc_bind" "$cua_bind" "$memory_limit"
+
+  if [ "$mode" = "clone" ]; then
+    refresh_vm_vnc_password "$name" "$user" "$vnc_password"
+    clear_vm_chromium_locks "$name" "$user"
+  fi
+
+  configure_proxy_devices "$name" "$ssh_bind" "$novnc_bind" "$cua_bind" "$reassign_if_busy"
+
+  if [ "$mode" != "clone" ]; then
+    sync_repo_to_vm "$name" "$user"
+    sync_profiles "$name" "$user"
+    run_install "$name" "$user"
+  fi
+
+  ensure_box_ssh_key "$name" "$user"
+  write_ssh_config "$name" "$user" "$SSH_PORT"
 }
 
-archive_path_for_name() {
-  local name="$1"
-  printf '%s/%s.tar.gz' "$ARCHIVE_DIR" "$name"
+finalize_cloned_box() {
+  local name="$1" port_base="$2" ssh_bind="$3" novnc_bind="$4" cua_bind="$5" memory_limit="${6:-}"
+
+  validate_name "$name"; validate_port_base "$port_base"
+  ports_from_base "$port_base"; check_port_block_free "$port_base" "$name"
+  remove_proxy_devices "$name"
+  configure_base_lxd "$name"
+  reset_cloned_network_identity "$name"
+  start_instance "$name"; wait_for_lxc "$name"; set_vm_hostname "$name"
+  load_box_env "$name" || die "$name is not a managed sandbox; missing box.env"
+  ensure_user "$name" "$SANDBOX_USER"
+
+  # Resolve memory limit: explicit arg → recorded → LXD actual
+  if [ -z "$memory_limit" ]; then
+    if [ -n "${MEMORY_LIMIT:-}" ]; then :; else load_lxd_memory_limit "$name"; memory_limit="$LXD_MEMORY_LIMIT"; fi
+  fi
+
+  PORT_BASE="$port_base"; SSH_BIND="$ssh_bind"; NOVNC_BIND="$novnc_bind"; CUA_BIND="$cua_bind"
+  ports_from_base "$PORT_BASE"
+  VNC_PASSWORD="$(generate_password)"
+  apply_managed_box_state "$name" "$SANDBOX_USER" "$port_base" "$ssh_bind" "$novnc_bind" "$cua_bind" \
+    "$memory_limit" "$VNC_PASSWORD" no clone
 }
 
 resolve_archive_source() {
   local source="$1"
-  if [ -f "$source" ]; then
-    printf '%s' "$source"
-    return
-  fi
-  case "$source" in
-    */*) die "Archive file not found: ${source}" ;;
-  esac
-  local default_path
-  default_path="$(archive_path_for_name "$source")"
-  [ -f "$default_path" ] || die "Archive not found: ${source}; expected ${default_path}"
+  [ -f "$source" ] && { printf '%s' "$source"; return; }
+  case "$source" in */*) die "Archive not found: $source" ;; esac
+  local default_path; default_path="$(archive_path_for_name "$source")"
+  [ -f "$default_path" ] || die "Archive not found: $source; expected $default_path"
   printf '%s' "$default_path"
 }
 
-parse_clone_bind_args() {
-  CLONE_PORT_BASE=""
-  CLONE_SSH_BIND="$DEFAULT_BIND"
-  CLONE_NOVNC_BIND="$DEFAULT_BIND"
-  CLONE_CUA_BIND="$DEFAULT_BIND"
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --port-base) CLONE_PORT_BASE="${2:-}"; shift 2 ;;
-      --bind) CLONE_SSH_BIND="$(normalize_bind "${2:-}")"; CLONE_NOVNC_BIND="$CLONE_SSH_BIND"; CLONE_CUA_BIND="$CLONE_SSH_BIND"; shift 2 ;;
-      --ssh-bind) CLONE_SSH_BIND="$(normalize_bind "${2:-}")"; shift 2 ;;
-      --novnc-bind) CLONE_NOVNC_BIND="$(normalize_bind "${2:-}")"; shift 2 ;;
-      --cua-bind) CLONE_CUA_BIND="$(normalize_bind "${2:-}")"; shift 2 ;;
-      --public) CLONE_SSH_BIND="0.0.0.0"; CLONE_NOVNC_BIND="0.0.0.0"; CLONE_CUA_BIND="0.0.0.0"; shift ;;
-      --*) die "Unknown option: $1" ;;
-      *) die "Unexpected argument: $1" ;;
-    esac
-  done
-  if [ -n "$CLONE_PORT_BASE" ]; then
-    validate_port_base "$CLONE_PORT_BASE"
-  else
-    CLONE_PORT_BASE="$(find_free_port_base "$DEFAULT_PORT_BASE")"
-  fi
-}
-
-finalize_cloned_box() {
-  local name="$1"
-  local port_base="$2"
-  local ssh_bind="$3"
-  local novnc_bind="$4"
-  local cua_bind="$5"
-  local memory_limit="${6:-}"
-
-  validate_name "$name"
-  validate_port_base "$port_base"
-  ports_from_base "$port_base"
-  check_port_block_free "$port_base" "$name"
-
-  remove_proxy_devices "$name"
-  configure_base_lxd "$name"
-  reset_cloned_network_identity "$name"
-  start_instance "$name"
-  wait_for_lxc "$name"
-  set_vm_hostname "$name"
-  load_box_env "$name" || die "${name} is not a managed sandbox archive/copy; missing box.env"
-  ensure_user "$name" "$SANDBOX_USER"
-  if [ -n "$memory_limit" ]; then
-    MEMORY_LIMIT="$memory_limit"
-  elif [ -z "${MEMORY_LIMIT:-}" ]; then
-    load_lxd_memory_limit "$name"
-    MEMORY_LIMIT="$LXD_MEMORY_LIMIT"
-  fi
-
-  PORT_BASE="$port_base"
-  SSH_BIND="$ssh_bind"
-  NOVNC_BIND="$novnc_bind"
-  CUA_BIND="$cua_bind"
-  ports_from_base "$PORT_BASE"
-  VNC_PASSWORD="$(generate_password)"
-  apply_memory_limit "$name" "$MEMORY_LIMIT"
-  write_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" "$MEMORY_LIMIT"
-  refresh_vm_vnc_password "$name" "$SANDBOX_USER" "$VNC_PASSWORD"
-  clear_vm_chromium_locks "$name" "$SANDBOX_USER"
-  configure_proxy_devices "$name" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND"
-  ensure_box_ssh_key "$name" "$SANDBOX_USER"
-  write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
-}
+# ── Commands ─────────────────────────────────────────────────────────────────
 
 cmd_create() {
-  require_cmd lxc
-  require_cmd ss
-  local name=""
-  local user="$DEFAULT_USER"
-  local user_explicit="no"
-  local port_base=""
-  local ssh_bind="$DEFAULT_BIND"
-  local novnc_bind="$DEFAULT_BIND"
-  local cua_bind="$DEFAULT_BIND"
-  local from_source=""
-  local grant_github="no"
-  local memory_limit="$DEFAULT_MEMORY_LIMIT"
+  require_cmd lxc; require_cmd ss
+  local name="" user="$DEFAULT_USER" user_explicit=no port_base=""
+  local ssh_bind="$DEFAULT_BIND" novnc_bind="$DEFAULT_BIND" cua_bind="$DEFAULT_BIND"
+  local from_source="" grant_github=no memory_limit="$DEFAULT_MEMORY_LIMIT"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --port-base) port_base="${2:-}"; shift 2 ;;
-      --user) user="${2:-}"; user_explicit="yes"; shift 2 ;;
-      --bind) ssh_bind="$(normalize_bind "${2:-}")"; novnc_bind="$ssh_bind"; cua_bind="$ssh_bind"; shift 2 ;;
+      --user) user="${2:-}"; user_explicit=yes; shift 2 ;;
+      --bind)     ssh_bind="$(normalize_bind "${2:-}")"; novnc_bind="$ssh_bind"; cua_bind="$ssh_bind"; shift 2 ;;
       --ssh-bind) ssh_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
       --novnc-bind) novnc_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
       --cua-bind) cua_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
       --memory) memory_limit="${2:-}"; validate_memory_limit "$memory_limit"; shift 2 ;;
-      --public) ssh_bind="0.0.0.0"; novnc_bind="0.0.0.0"; cua_bind="0.0.0.0"; shift ;;
-      --github) grant_github="yes"; shift ;;
-      --from) from_source="${2:-}"; shift 2 ;;
+      --public)  ssh_bind="0.0.0.0"; novnc_bind="0.0.0.0"; cua_bind="0.0.0.0"; shift ;;
+      --github)  grant_github=yes; shift ;;
+      --from)    from_source="${2:-}"; shift 2 ;;
       -h|--help) command_help create; exit 0 ;;
-      --*) die "Unknown create option: $1" ;;
+      --*) die "Unknown option: $1" ;;
       *) [ -z "$name" ] || die "Unexpected argument: $1"; name="$1"; shift ;;
     esac
   done
   [ -n "$name" ] || die "Missing NAME"
-  validate_name "$name"
-  validate_user "$user"
-  validate_memory_limit "$memory_limit"
+  validate_name "$name"; validate_user "$user"; validate_memory_limit "$memory_limit"
+
   if [ -n "$from_source" ]; then
-    [ "$user_explicit" = "no" ] || die "--user is only supported for clean creates; imported boxes keep their archived user"
-    instance_exists "$name" && die "LXD instance already exists: ${name}; use update"
-    local archive
-    archive="$(resolve_archive_source "$from_source")"
-    if [ -n "$port_base" ]; then
-      validate_port_base "$port_base"
-    else
-      port_base="$(find_free_port_base "$DEFAULT_PORT_BASE")"
-    fi
+    [ "$user_explicit" = "no" ] || die "--user is only for clean creates; imported boxes keep their archived user"
+    instance_exists "$name" && die "LXD instance already exists: $name; use update"
+    local archive; archive="$(resolve_archive_source "$from_source")"
+    if [ -n "$port_base" ]; then validate_port_base "$port_base"; else port_base="$(find_free_port_base "$DEFAULT_PORT_BASE")"; fi
     check_port_block_free "$port_base"
     log "Importing ${name} from ${archive}"
     lxc import "$archive" "$name"
     finalize_cloned_box "$name" "$port_base" "$ssh_bind" "$novnc_bind" "$cua_bind" "$memory_limit"
-    if [ "$grant_github" = "yes" ]; then
-      github_grant "$name"
-    fi
+    if [ "$grant_github" = "yes" ]; then github_grant "$name"; fi
     cmd_doctor "$name"
     log "Created ${name}"
-    printf 'SSH:   ssh %s\n' "$name"
-    printf 'noVNC: http://127.0.0.1:%s/\n' "$NOVNC_PORT"
+    printf 'SSH:   ssh %s\nnoVNC: http://127.0.0.1:%s/\n' "$name" "$NOVNC_PORT"
     return
   fi
-  if [ -n "$port_base" ]; then
-    validate_port_base "$port_base"
-  else
-    port_base="$(find_free_port_base "$DEFAULT_PORT_BASE")"
-  fi
+
+  if [ -n "$port_base" ]; then validate_port_base "$port_base"; else port_base="$(find_free_port_base "$DEFAULT_PORT_BASE")"; fi
   ports_from_base "$port_base"
   check_port_block_free "$port_base"
-  instance_exists "$name" && die "LXD instance already exists: ${name}; use update"
-
+  instance_exists "$name" && die "LXD instance already exists: $name; use update"
   log "Launching ${name} from ${DEFAULT_IMAGE}"
   lxc launch "$DEFAULT_IMAGE" "$name"
   apply_memory_limit "$name" "$memory_limit"
-  start_instance "$name"
-  wait_for_lxc "$name"
-  configure_base_lxd "$name"
-  set_vm_hostname "$name"
-  ensure_user "$name" "$user"
-  local pw
-  pw="$(generate_password)"
-  write_box_env "$name" "$user" "$port_base" "$pw" "$ssh_bind" "$novnc_bind" "$cua_bind" "$memory_limit"
-  configure_proxy_devices "$name" "$ssh_bind" "$novnc_bind" "$cua_bind"
-  sync_repo_to_vm "$name" "$user"
-  ensure_box_ssh_key "$name" "$user"
-  sync_host_codex_profile "$name" "$user"
-  sync_host_claude_profile "$name" "$user"
-  sync_host_opencode_profile "$name" "$user"
-  run_install "$name" "$user"
-  write_ssh_config "$name" "$user" "$SSH_PORT"
-  if [ "$grant_github" = "yes" ]; then
-    github_grant "$name"
-  fi
+  start_instance "$name"; wait_for_lxc "$name"; set_vm_hostname "$name"
+  local pw; pw="$(generate_password)"
+  apply_managed_box_state "$name" "$user" "$port_base" "$ssh_bind" "$novnc_bind" "$cua_bind" "$memory_limit" "$pw" no fresh
+  if [ "$grant_github" = "yes" ]; then github_grant "$name"; fi
   cmd_doctor "$name"
   log "Created ${name}"
-  printf 'SSH:   ssh %s\n' "$name"
-  printf 'noVNC: http://127.0.0.1:%s/\n' "$NOVNC_PORT"
+  printf 'SSH:   ssh %s\nnoVNC: http://127.0.0.1:%s/\n' "$name" "$NOVNC_PORT"
 }
 
 cmd_update() {
-  require_cmd lxc
-  require_cmd ss
+  require_cmd lxc; require_cmd ss
   local name="${1:-}"
   [ -n "$name" ] || die "Missing NAME"
-  shift || true
-  [ "$#" -eq 0 ] || die "Unexpected update argument: $1"
+  shift || true; [ "$#" -eq 0 ] || die "Unexpected argument: $1"
   validate_name "$name"
-  instance_exists "$name" || die "LXD instance not found: ${name}"
-  start_instance "$name"
-  wait_for_lxc "$name"
-  set_vm_hostname "$name"
-  load_box_env "$name" || die "No box.env found for ${name}; this box predates managed config"
-  ensure_user "$name" "$SANDBOX_USER"
-  configure_base_lxd "$name"
-  apply_memory_limit "$name" "$MEMORY_LIMIT"
-  configure_proxy_devices "$name" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" yes
-  write_box_env "$name" "$SANDBOX_USER" "$PORT_BASE" "$VNC_PASSWORD" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" "$MEMORY_LIMIT"
-  sync_repo_to_vm "$name" "$SANDBOX_USER"
-  ensure_box_ssh_key "$name" "$SANDBOX_USER"
-  sync_host_codex_profile "$name" "$SANDBOX_USER"
-  sync_host_claude_profile "$name" "$SANDBOX_USER"
-  sync_host_opencode_profile "$name" "$SANDBOX_USER"
-  run_install "$name" "$SANDBOX_USER"
-  write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
+  instance_exists "$name" || die "LXD instance not found: $name"
+  start_instance "$name"; wait_for_lxc "$name"; set_vm_hostname "$name"
+  load_box_env "$name" || die "No box.env for $name; run update first"
+  apply_managed_box_state "$name" "$SANDBOX_USER" "$PORT_BASE" "$SSH_BIND" "$NOVNC_BIND" "$CUA_BIND" \
+    "$MEMORY_LIMIT" "$VNC_PASSWORD" yes update
   cmd_doctor "$name"
   log "Updated ${name}"
 }
@@ -1808,40 +910,24 @@ cmd_start() {
   local name="${1:-}"
   [ -n "$name" ] || die "Missing NAME"
   validate_name "$name"
-  instance_exists "$name" || die "LXD instance not found: ${name}"
-  load_instance_status "$name" || die "Could not read LXD status for ${name}"
+  instance_exists "$name" || die "LXD instance not found: $name"
+  load_instance_status "$name" || die "Could not read LXD status for $name"
   if instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then
-    die "${name} is in LXD split-brain state: LXD reports ERROR while a container monitor is still live; run: sandbox stop ${name}"
+    die "$name is in LXD split-brain; run: sandbox stop $name"
   fi
-  if [ "$INSTANCE_STATUS" = "STOPPED" ]; then
-    log "Starting ${name}"
-    lxc start "$name"
-  else
-    log "${name} is already ${INSTANCE_STATUS}"
-  fi
+  if [ "$INSTANCE_STATUS" = "STOPPED" ]; then log "Starting $name"; lxc start "$name"; else log "$name is already $INSTANCE_STATUS"; fi
   wait_for_lxc "$name"
-  log "Enabling ${name} autostart"
   lxc config set "$name" boot.autostart true
   load_box_env "$name" || die "No box.env found; run update first"
   write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
-  local deadline ready="no" ssh_err
-  deadline=$((SECONDS + 30))
-  ssh_err="$(mktemp)"
+  # Wait for SSH to become usable (30s window)
+  local deadline=$((SECONDS + 30))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if ssh_hostname_matches "$name" 2>"$ssh_err"; then
-      ready="yes"
-      break
-    fi
+    ssh_hostname_matches "$name" 2>/dev/null && break
     sleep 1
   done
-  if [ "$ready" != "yes" ]; then
-    sed 's/^/[sandbox][ssh] /' "$ssh_err" >&2 || true
-    rm -f "$ssh_err"
-    die "SSH did not become usable: ssh ${name} hostname"
-  fi
-  rm -f "$ssh_err"
-  printf 'SSH:   ssh %s\n' "$name"
-  printf 'noVNC: http://127.0.0.1:%s/\n' "$NOVNC_PORT"
+  ssh_hostname_matches "$name" || die "SSH did not become usable: ssh $name hostname"
+  printf 'SSH:   ssh %s\nnoVNC: http://127.0.0.1:%s/\n' "$name" "$NOVNC_PORT"
 }
 
 cmd_stop() {
@@ -1849,104 +935,89 @@ cmd_stop() {
   local name="${1:-}"
   [ -n "$name" ] || die "Missing NAME"
   validate_name "$name"
-  instance_exists "$name" || die "LXD instance not found: ${name}"
-  load_instance_status "$name" || die "Could not read LXD status for ${name}"
-  log "Disabling ${name} autostart"
+  instance_exists "$name" || die "LXD instance not found: $name"
+  load_instance_status "$name" || die "Could not read LXD status for $name"
   lxc config set "$name" boot.autostart false
-  if [ "$INSTANCE_STATUS" = "STOPPED" ]; then
-    log "${name} is already STOPPED"
-    return
-  fi
+  if [ "$INSTANCE_STATUS" = "STOPPED" ]; then log "$name is already STOPPED"; return; fi
   if instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then
-    warn "${name} is in LXD split-brain state; autostart is disabled, but live container processes may require host/LXD recovery"
+    warn "$name is in split-brain; autostart disabled but live processes may need LXD recovery"
     return
   fi
-  log "Stopping ${name}"
-  lxc stop "$name"
-  log "Stopped ${name}"
+  log "Stopping $name"; lxc stop "$name"; log "Stopped $name"
 }
 
 cmd_copy() {
-  require_cmd lxc
-  require_cmd ss
-  local source="${1:-}"
-  local dest="${2:-}"
-  [ -n "$source" ] || die "Missing SOURCE"
-  [ -n "$dest" ] || die "Missing DEST"
+  require_cmd lxc; require_cmd ss
+  local source="${1:-}" dest="${2:-}"
+  [ -n "$source" ] || die "Missing SOURCE"; [ -n "$dest" ] || die "Missing DEST"
   shift 2
-  validate_name "$source"
-  validate_name "$dest"
-  instance_exists "$source" || die "LXD instance not found: ${source}"
-  instance_exists "$dest" && die "LXD instance already exists: ${dest}"
+  validate_name "$source"; validate_name "$dest"
+  instance_exists "$source" || die "LXD instance not found: $source"
+  instance_exists "$dest" && die "LXD instance already exists: $dest"
   require_stopped_instance "$source"
-  parse_clone_bind_args "$@"
 
-  log "Copying ${source} to ${dest}"
+  # Parse bind options (shared pattern with create)
+  local port_base="" ssh_bind="$DEFAULT_BIND" novnc_bind="$DEFAULT_BIND" cua_bind="$DEFAULT_BIND"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --port-base) port_base="${2:-}"; shift 2 ;;
+      --bind)     ssh_bind="$(normalize_bind "${2:-}")"; novnc_bind="$ssh_bind"; cua_bind="$ssh_bind"; shift 2 ;;
+      --ssh-bind) ssh_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
+      --novnc-bind) novnc_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
+      --cua-bind) cua_bind="$(normalize_bind "${2:-}")"; shift 2 ;;
+      --public)  ssh_bind="0.0.0.0"; novnc_bind="0.0.0.0"; cua_bind="0.0.0.0"; shift ;;
+      --*) die "Unknown option: $1" ;;
+      *) die "Unexpected argument: $1" ;;
+    esac
+  done
+  if [ -n "$port_base" ]; then validate_port_base "$port_base"; else port_base="$(find_free_port_base "$DEFAULT_PORT_BASE")"; fi
+
+  log "Copying $source to $dest"
   lxc copy "$source" "$dest" --instance-only
-  finalize_cloned_box "$dest" "$CLONE_PORT_BASE" "$CLONE_SSH_BIND" "$CLONE_NOVNC_BIND" "$CLONE_CUA_BIND"
+  finalize_cloned_box "$dest" "$port_base" "$ssh_bind" "$novnc_bind" "$cua_bind"
   cmd_doctor "$dest"
-  log "Copied ${source} to ${dest}"
-  printf 'SSH:   ssh %s\n' "$dest"
-  printf 'noVNC: http://127.0.0.1:%s/\n' "$NOVNC_PORT"
+  log "Copied $source to $dest"
+  printf 'SSH:   ssh %s\nnoVNC: http://127.0.0.1:%s/\n' "$dest" "$NOVNC_PORT"
 }
 
 cmd_export() {
   require_cmd lxc
-  local name="${1:-}"
-  local target="${2:-}"
+  local name="${1:-}" target="${2:-}"
   [ -n "$name" ] || die "Missing NAME"
   [ "$#" -le 2 ] || die "Unexpected argument: $3"
   validate_name "$name"
-  instance_exists "$name" || die "LXD instance not found: ${name}"
+  instance_exists "$name" || die "LXD instance not found: $name"
   require_stopped_instance "$name"
   ensure_state_dirs
-  if [ -z "$target" ]; then
-    target="$(archive_path_for_name "$name")"
-  fi
+  if [ -z "$target" ]; then target="$(archive_path_for_name "$name")"; fi
   mkdir -p "$(dirname "$target")"
-  local tmp="${target}.tmp"
-  rm -f "$tmp"
-  log "Exporting ${name} to ${target}"
+  local tmp="${target}.tmp"; rm -f "$tmp"
+  log "Exporting $name to $target"
   lxc export "$name" "$tmp" --instance-only
-  mv -f "$tmp" "$target"
-  chmod 600 "$target"
-  ls -lh "$target"
+  mv -f "$tmp" "$target"; chmod 600 "$target"; ls -lh "$target"
 }
 
 cmd_github() {
-  local name=""
-  local revoke="no"
+  local name="" revoke=no
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --revoke) revoke="yes"; shift ;;
+      --revoke) revoke=yes; shift ;;
       -h|--help) command_help github; exit 0 ;;
-      --*) die "Unknown github option: $1" ;;
+      --*) die "Unknown option: $1" ;;
       *) [ -z "$name" ] || die "Unexpected argument: $1"; name="$1"; shift ;;
     esac
   done
   [ -n "$name" ] || die "Missing NAME"
   validate_name "$name"
-  if [ "$revoke" = "yes" ]; then
-    github_revoke "$name"
-  else
-    github_grant "$name"
-  fi
+  if [ "$revoke" = "yes" ]; then github_revoke "$name"; else github_grant "$name"; fi
 }
 
 cmd_doctor() {
-  require_cmd lxc
-  require_cmd curl
-  local name=""
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -h|--help) command_help doctor; exit 0 ;;
-      --*) die "Unknown doctor option: $1" ;;
-      *) [ -z "$name" ] || die "Unexpected argument: $1"; name="$1"; shift ;;
-    esac
-  done
+  require_cmd lxc; require_cmd curl
+  local name="${1:-}"
   [ -n "$name" ] || die "Missing NAME"
   validate_name "$name"
-  instance_exists "$name" || die "LXD instance not found: ${name}"
+  instance_exists "$name" || die "LXD instance not found: $name"
   load_box_env "$name" || die "No box.env found; run update first"
   write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
   doctor "$name"
@@ -1968,135 +1039,52 @@ cmd_ssh() {
   load_box_env "$name" || die "No box.env found; run update first"
   write_ssh_config "$name" "$SANDBOX_USER" "$SSH_PORT"
   if [ "${1:-}" = "--" ]; then shift; fi
-  if [ "$#" -gt 0 ]; then
-    ssh "$name" "$@"
+  ssh "$name" "$@"
+}
+
+# ── List / detail ─────────────────────────────────────────────────────────────
+
+# Print "label addr" pairs for a bind address
+service_hosts_for_bind() {
+  case "$1" in
+    127.0.0.1|localhost) printf 'local 127.0.0.1\n' ;;
+    0.0.0.0)
+      printf 'local 127.0.0.1\n'
+      command -v ip >/dev/null 2>&1 && ip -o -4 addr show scope global up 2>/dev/null |
+        awk '$2 !~ /^(lo$|docker|br-|lxdbr|incusbr|virbr|veth|cni|flannel|kube|podman)/ {
+          sub(/:$/,"",$2); split($4,a,"/"); if (!seen[a[1]]++) print $2, a[1]
+        }'
+      ;;
+    *)
+      local label; label="$(ip -o -4 addr show 2>/dev/null | awk -v ip="$1" '$2 !~ /^(lo|docker|br-|lxdbr|incusbr|virbr|veth|cni|flannel|kube|podman)/ { split($4,a,"/"); if (a[1]==ip) { sub(/:$/,"",$2); print $2; exit } }')"
+      printf '%s %s\n' "${label:-host}" "$1"
+      ;;
+  esac
+}
+
+# One-line exposure summary for table view
+exposure_summary() {
+  local ssh_b="$1" novnc_b="$2" cua_b="$3"
+  if [ "$ssh_b" = "$novnc_b" ] && [ "$novnc_b" = "$cua_b" ]; then
+    [ "$ssh_b" = "0.0.0.0" ] && printf 'public' || printf 'local'
   else
-    ssh "$name"
+    printf 'ssh=%s,novnc=%s,cua=%s' "$ssh_b" "$novnc_b" "$cua_b"
   fi
-}
-
-network_labels_csv() {
-  local bind="$1"
-  local label addr out=""
-  while read -r label addr; do
-    [ -n "$label" ] || continue
-    [ "$addr" = "127.0.0.1" ] && continue
-    if [ -z "$out" ]; then
-      out="$label"
-    else
-      out="${out},${label}"
-    fi
-  done < <(service_hosts_for_bind "$bind")
-  printf '%s' "$out"
-}
-
-summarize_exposure() {
-  local ssh_bind="$1"
-  local novnc_bind="$2"
-  local cua_bind="$3"
-  local service bind labels first label service_csv out pair
-  local -a services=()
-  local -a label_sets=()
-
-  for service in ssh noVNC CUA; do
-    case "$service" in
-      ssh) bind="$ssh_bind" ;;
-      noVNC) bind="$novnc_bind" ;;
-      CUA) bind="$cua_bind" ;;
-    esac
-    labels="$(network_labels_csv "$bind")"
-    if [ -n "$labels" ]; then
-      services+=("$service")
-      label_sets+=("$labels")
-    fi
-  done
-
-  if [ "${#services[@]}" -eq 0 ]; then
-    printf 'local'
-    return
-  fi
-
-  first="${label_sets[0]}"
-  for label in "${label_sets[@]}"; do
-    if [ "$label" != "$first" ]; then
-      out=""
-      for service in "${!services[@]}"; do
-        pair="${services[$service]} on ${label_sets[$service]}"
-        if [ -z "$out" ]; then
-          out="$pair"
-        else
-          out="${out}; ${pair}"
-        fi
-      done
-      printf '%s' "$out"
-      return
-    fi
-  done
-
-  service_csv="$(IFS=,; printf '%s' "${services[*]}")"
-  printf '%s on %s' "$service_csv" "$first"
-}
-
-first_service_addr() {
-  local bind="$1"
-  local label addr
-  while read -r label addr; do
-    [ -n "$label" ] || continue
-    printf '%s' "$addr"
-    return
-  done < <(service_hosts_for_bind "$bind")
-}
-
-print_ssh_detail() {
-  local name="$1"
-  local user="$2"
-  local bind="$3"
-  local port="$4"
-  local key_path="$5"
-  local label addr
-  while read -r label addr; do
-    [ -n "$label" ] || continue
-    if [ "$addr" = "127.0.0.1" ]; then
-      printf '  local: %s (%s:%s)\n' "ssh $name" "$addr" "$port"
-    else
-      printf '  %s: ssh -i %s -p %s %s@%s\n' "$label" "$key_path" "$port" "$user" "$addr"
-    fi
-  done < <(service_hosts_for_bind "$bind")
-}
-
-print_url_detail() {
-  local bind="$1"
-  local port="$2"
-  local label addr
-  while read -r label addr; do
-    [ -n "$label" ] || continue
-    printf '  %s: http://%s:%s/\n' "$label" "$addr" "$port"
-  done < <(service_hosts_for_bind "$bind")
 }
 
 print_list_row() {
-  local name="$1"
-  local status="$2"
-  local warning=""
-  if instance_lxd_split_brain "$name" "$status"; then
-    status="ERROR*"
-    warning="; lxd split-brain"
-  fi
+  local name="$1" status="$2" warning=""
+  if instance_lxd_split_brain "$name" "$status"; then status="ERROR*"; warning="; lxd split-brain"; fi
   if load_box_env "$name" >/dev/null 2>&1; then
     effective_proxy "$name" ai-sandbox-ssh "$SSH_BIND" "$SSH_PORT"
     local ssh_bind="$EFFECTIVE_BIND"
-    local ssh_port="$EFFECTIVE_PORT"
     effective_proxy "$name" ai-sandbox-novnc "$NOVNC_BIND" "$NOVNC_PORT"
-    local novnc_bind="$EFFECTIVE_BIND"
-    local novnc_port="$EFFECTIVE_PORT"
+    local novnc_bind="$EFFECTIVE_BIND" novnc_port="$EFFECTIVE_PORT"
     effective_proxy "$name" ai-sandbox-cua "$CUA_BIND" "$CUA_PORT"
-    local cua_bind="$EFFECTIVE_BIND"
-    local cua_port="$EFFECTIVE_PORT"
-    local novnc_host exposure
-    novnc_host="$(first_service_addr "$novnc_bind")"
-    exposure="$(summarize_exposure "$ssh_bind" "$novnc_bind" "$cua_bind")"
+    local novnc_host; novnc_host="$(service_hosts_for_bind "$novnc_bind" | head -1 | awk '{print $2}')"
     printf '%-28s %-10s %-24s %-28s %s\n' \
-      "$name" "$status" "ssh $name" "http://${novnc_host}:${novnc_port}/" "${exposure}${warning}"
+      "$name" "$status" "ssh $name" "http://${novnc_host}:${novnc_port}/" \
+      "$(exposure_summary "$ssh_bind" "$novnc_bind" "$EFFECTIVE_BIND")${warning}"
   else
     printf '%-28s %-10s %-24s %-28s %s\n' "$name" "$status" "-" "-" "unmanaged${warning}"
   fi
@@ -2105,129 +1093,140 @@ print_list_row() {
 print_list_detail() {
   local name="$1"
   validate_name "$name"
-  instance_exists "$name" || die "LXD instance not found: ${name}"
-  load_instance_status "$name" || die "Could not read LXD status for ${name}"
-
-  printf 'name: %s\n' "$name"
-  printf 'status: %s\n' "$INSTANCE_STATUS"
-  if instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then
-    printf 'warning: LXD split-brain; status is ERROR while a container monitor is still live\n'
-  fi
-  if ! load_box_env "$name" >/dev/null 2>&1; then
-    printf 'managed: no\n'
-    printf 'box.env: missing\n'
-    return
-  fi
-
+  instance_exists "$name" || die "LXD instance not found: $name"
+  load_instance_status "$name" || die "Could not read LXD status for $name"
+  printf 'name: %s\nstatus: %s\n' "$name" "$INSTANCE_STATUS"
+  if instance_lxd_split_brain "$name" "$INSTANCE_STATUS"; then printf 'warning: LXD split-brain\n'; fi
+  if ! load_box_env "$name" >/dev/null 2>&1; then printf 'managed: no\nbox.env: missing\n'; return; fi
   effective_proxy "$name" ai-sandbox-ssh "$SSH_BIND" "$SSH_PORT"
-  local ssh_bind="$EFFECTIVE_BIND"
-  local ssh_port="$EFFECTIVE_PORT"
+  local ssh_bind="$EFFECTIVE_BIND" ssh_port="$EFFECTIVE_PORT"
   effective_proxy "$name" ai-sandbox-novnc "$NOVNC_BIND" "$NOVNC_PORT"
-  local novnc_bind="$EFFECTIVE_BIND"
-  local novnc_port="$EFFECTIVE_PORT"
+  local novnc_bind="$EFFECTIVE_BIND" novnc_port="$EFFECTIVE_PORT"
   effective_proxy "$name" ai-sandbox-cua "$CUA_BIND" "$CUA_PORT"
-  local cua_bind="$EFFECTIVE_BIND"
-  local cua_port="$EFFECTIVE_PORT"
+  local cua_bind="$EFFECTIVE_BIND" cua_port="$EFFECTIVE_PORT"
   load_lxd_memory_limit "$name"
-  local memory_summary
-  memory_summary="$(memory_limit_display "$MEMORY_LIMIT" "$LXD_MEMORY_LIMIT")"
   local key_path="${SSH_KEY_DIR}/${name}_ed25519"
-  local host_alias
-  host_alias="$(managed_host_alias "$name")"
-
-  printf 'user: %s\n\n' "$SANDBOX_USER"
-  printf 'ssh:\n'
-  printf '  alias: ssh %s\n' "$name"
-  printf '  private key path: %s\n' "$key_path"
-  printf '  known hosts: %s\n' "$SSH_KNOWN_HOSTS"
-  printf '  host key alias: %s\n' "$host_alias"
-  print_ssh_detail "$name" "$SANDBOX_USER" "$ssh_bind" "$ssh_port" "$key_path"
+  printf 'user: %s\n\nssh:\n  alias: ssh %s\n  private key path: %s\n  known hosts: %s\n  host key alias: %s\n' \
+    "$SANDBOX_USER" "$name" "$key_path" "$SSH_KNOWN_HOSTS" "$(managed_host_alias "$name")"
+  local label addr
+  while read -r label addr; do
+    [ -n "$label" ] || continue
+    if [ "$addr" = "127.0.0.1" ]; then addr="$addr:$ssh_port"; fi
+    printf '  %s: ssh -i %s -p %s %s@%s\n' "$label" "$key_path" "$ssh_port" "$SANDBOX_USER" "$addr"
+  done < <(service_hosts_for_bind "$ssh_bind")
   printf '\nnoVNC:\n'
-  print_url_detail "$novnc_bind" "$novnc_port"
+  while read -r label addr; do [ -n "$label" ] && printf '  %s: http://%s:%s/\n' "$label" "$addr" "$novnc_port"; done < <(service_hosts_for_bind "$novnc_bind")
   printf '\nCUA:\n'
-  print_url_detail "$cua_bind" "$cua_port"
-  printf '\nconfig:\n'
-  printf '  ports: ssh=%s novnc=%s cua=%s\n' "$ssh_port" "$novnc_port" "$cua_port"
-  printf '  binds: ssh=%s novnc=%s cua=%s\n' "$ssh_bind" "$novnc_bind" "$cua_bind"
-  printf '  memory limit: %s\n' "$memory_summary"
+  while read -r label addr; do [ -n "$label" ] && printf '  %s: http://%s:%s/\n' "$label" "$addr" "$cua_port"; done < <(service_hosts_for_bind "$cua_bind")
+  printf '\nconfig:\n  ports: ssh=%s novnc=%s cua=%s\n  binds: ssh=%s novnc=%s cua=%s\n  memory: recorded=%s actual=%s\n' \
+    "$ssh_port" "$novnc_port" "$cua_port" "$ssh_bind" "$novnc_bind" "$cua_bind" "${MEMORY_LIMIT:-none}" "${LXD_MEMORY_LIMIT:-none}"
 }
 
 cmd_list() {
-  if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    command_help list
-    exit 0
-  fi
+  if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then command_help list; exit 0; fi
   [ "$#" -le 1 ] || die "Unexpected argument: $2"
-  if [ "$#" -eq 1 ]; then
-    case "$1" in
-      --*) die "Unknown list option: $1" ;;
-    esac
-    print_list_detail "$1"
-    return
-  fi
-
-  local rows line name status
-  rows="$(mktemp)"
-  lxc_query list --format csv -c ns >"$rows"
+  if [ "$#" -eq 1 ]; then case "$1" in --*) die "Unknown option: $1"; esac; print_list_detail "$1"; return; fi
+  local rows name status
   printf '%-28s %-10s %-24s %-28s %s\n' "NAME" "STATUS" "SSH" "NOVNC" "EXPOSURE"
-  while IFS=, read -r name status _rest; do
+  while IFS=, read -r name status _; do
     [ -n "$name" ] || continue
-    print_list_row "$name" "$status"
-  done <"$rows"
-  rm -f "$rows"
+    print_list_row "$name" "$status" || true
+  done < <(lxc_query list --format csv -c ns)
 }
 
 cmd_destroy() {
   local name="${1:-}"
   [ -n "$name" ] || die "Missing NAME"
   validate_name "$name"
-  instance_exists "$name" || die "LXD instance not found: ${name}"
-  printf 'This will permanently delete LXD instance %s, revoke its recorded GitHub key if granted, and remove its managed SSH config, known-host entry, and keypair.\n' "$name" >&2
+  instance_exists "$name" || die "LXD instance not found: $name"
+  printf 'This will permanently delete LXD instance %s and remove its host-side state.\n' "$name" >&2
   printf 'Type the exact box name to continue: ' >&2
-  local answer
-  read -r answer
+  local answer; read -r answer
   [ "$answer" = "$name" ] || die "Confirmation did not match; aborting"
-  GITHUB_SSH_KEY_TITLE=""
-  GITHUB_SSH_KEY_FINGERPRINT=""
-  GITHUB_SSH_KEY_ID=""
-  if load_box_env "$name" >/dev/null 2>&1 && github_state_granted; then
-    github_revoke "$name"
-  fi
-  log "Removing managed SSH config block for ${name}"
+  if load_box_env "$name" >/dev/null 2>&1 && github_state_granted; then github_revoke "$name"; fi
   remove_managed_ssh_block "$name"
-  log "Removing managed SSH known-host entry for ${name}"
   remove_managed_known_host "$name"
-  log "Removing per-box SSH keypair for ${name}"
   rm -f "${SSH_KEY_DIR}/${name}_ed25519" "${SSH_KEY_DIR}/${name}_ed25519.pub"
-  log "Removing host box config mirror for ${name}"
   rm -f "$(host_box_env_path "$name")"
-  log "Deleting LXD instance ${name}"
+  log "Deleting LXD instance $name"
   lxc delete "$name" --force
-  log "Verifying ${name} is gone"
-  if instance_exists "$name"; then
-    die "LXD instance still exists after delete: ${name}"
-  fi
-  log "Destroyed ${name}"
+  ! instance_exists "$name" || die "LXD instance still exists after delete: $name"
+  log "Destroyed $name"
 }
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+Usage: sandbox COMMAND NAME [options]
+
+Commands:
+  create NAME [opts]  Create a new LXD box. --from ARCHIVE imports instead.
+  update NAME         Re-sync repo+profiles, re-run install+doctor.
+  start NAME          Start box, wait for SSH, print noVNC URL.
+  stop NAME           Stop box, disable autostart.
+  copy SRC DEST       Clone a stopped box with fresh ports/keys.
+  export NAME [FILE]  Export stopped box to tarball.
+  github NAME [--revoke]  Grant/revoke GitHub SSH push access.
+  doctor NAME         Run health checks (ports, SSH, desktop, agents).
+  view NAME           Print noVNC URL.
+  ssh NAME [-- CMD]   Open SSH session or run command.
+  list [NAME]         List all boxes or show detail for one.
+  destroy NAME        Delete box + remove host-side state.
+
+Options (create/copy):
+  --port-base N    Use N,N+1,N+2 for SSH,noVNC,CUA. Default: first free from 2230.
+  --bind ADDR      127.0.0.1 (default) or 0.0.0.0.
+  --ssh-bind/--novnc-bind/--cua-bind ADDR  Override per-service.
+  --public         Shorthand for --bind 0.0.0.0.
+  --memory LIMIT   LXD memory cap (default 100GiB, or "none").
+  --user USER      Runtime user for fresh creates (default: agent).
+  --github         Grant GitHub access after create.
+  --from ARCHIVE   Import tarball instead of fresh launch.
+
+Ports: SSH=base, noVNC=base+1, CUA=base+2.
+State: ~/.ai-sandbox/ (boxes, ssh, archives).
+EOF
+}
+
+command_help() {
+  case "${1:-}" in
+    create)  echo "sandbox create NAME [options] [--from ARCHIVE] — Create a new box or import an archive." ;;
+    update)  echo "sandbox update NAME — Re-sync repo+profiles, re-run install+doctor." ;;
+    start)   echo "sandbox start NAME — Start box, wait for SSH, print noVNC URL." ;;
+    stop)    echo "sandbox stop NAME — Stop box, disable autostart." ;;
+    copy|cp) echo "sandbox copy SOURCE DEST [options] — Clone a stopped box." ;;
+    export)  echo "sandbox export NAME [FILE] — Export stopped box to tarball." ;;
+    github)  echo "sandbox github NAME [--revoke] — Grant/revoke GitHub SSH access." ;;
+    doctor)  echo "sandbox doctor NAME — Run health checks." ;;
+    view)    echo "sandbox view NAME — Print noVNC URL." ;;
+    ssh)     echo "sandbox ssh NAME [-- COMMAND...] — SSH session or run command." ;;
+    list)    echo "sandbox list [NAME] — List boxes or show detail for one." ;;
+    destroy) echo "sandbox destroy NAME — Delete box + remove host-side state." ;;
+    *)       usage ;;
+  esac
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
   local cmd="${1:-help}"
   shift || true
   case "$cmd" in
-    create) cmd_create "$@" ;;
-    update) cmd_update "$@" ;;
-    start) cmd_start "$@" ;;
-    stop) cmd_stop "$@" ;;
+    create)  cmd_create "$@" ;;
+    update)  cmd_update "$@" ;;
+    start)   cmd_start "$@" ;;
+    stop)    cmd_stop "$@" ;;
     copy|cp) cmd_copy "$@" ;;
-    export) cmd_export "$@" ;;
-    github) cmd_github "$@" ;;
-    doctor) cmd_doctor "$@" ;;
-    view) cmd_view "$@" ;;
-    ssh) cmd_ssh "$@" ;;
-    list) cmd_list "$@" ;;
+    export)  cmd_export "$@" ;;
+    github)  cmd_github "$@" ;;
+    doctor)  cmd_doctor "$@" ;;
+    view)    cmd_view "$@" ;;
+    ssh)     cmd_ssh "$@" ;;
+    list)    cmd_list "$@" ;;
     destroy) cmd_destroy "$@" ;;
     help|-h|--help) command_help "${1:-}" ;;
-    *) die "Unknown command: ${cmd}" ;;
+    *) die "Unknown command: $cmd" ;;
   esac
 }
 

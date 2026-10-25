@@ -99,6 +99,16 @@ assert_http() {
   timeout 15 curl -fsS "$url" >/dev/null || fail "HTTP check failed: $url"
 }
 
+# The xfce failsafe dialog still serves VNC pixels, so prove the real session
+# started: the user owns its config directories, the xfce settings server
+# answers on the desktop's display, and xfdesktop is running.
+assert_desktop_session() {
+  local name="$1"
+  lxc exec "$name" -- runuser -u "$TEST_USER" -- bash -c \
+    'test -O "$HOME/.config" && test -O "$HOME/.ai-sandbox" && DISPLAY=:1 xfconf-query -c xsettings -p /Net/ThemeName && pgrep -u "$(id -u)" -x xfdesktop' \
+    >>"$LOG" 2>&1 || fail "$name desktop session is not running as $TEST_USER"
+}
+
 assert_destroyed() {
   local name="$1"
   ! instance_exists "$name" || fail "$name still exists after destroy"
@@ -140,8 +150,9 @@ assert_ssh "$PRIMARY"
 assert_eq "$PRIMARY" "$(timeout 15 "$SANDBOX_BIN" ssh "$PRIMARY" -- hostname)" "sandbox ssh"
 assert_http "$("$SANDBOX_BIN" view "$PRIMARY")"
 assert_http "http://127.0.0.1:$((PORT_BASE + 2))/status"
-"$SANDBOX_BIN" list | grep -Fq "$PRIMARY" || fail "compact list omitted $PRIMARY"
-"$SANDBOX_BIN" list "$PRIMARY" | grep -Fq "ssh $PRIMARY" || fail "detail list omitted SSH command"
+assert_desktop_session "$PRIMARY"
+"$SANDBOX_BIN" list | tee /tmp/sandbox-accept-list.txt | grep -F "$PRIMARY" >/dev/null || { cat /tmp/sandbox-accept-list.txt >&2; fail "compact list omitted $PRIMARY"; }
+"$SANDBOX_BIN" list "$PRIMARY" | tee /tmp/sandbox-accept-detail.txt | grep -F "ssh $PRIMARY" >/dev/null || { cat /tmp/sandbox-accept-detail.txt >&2; fail "detail list omitted SSH command"; }
 run "$SANDBOX_BIN" doctor "$PRIMARY"
 
 log "testing GitHub grant, authentication, and revoke"
@@ -170,6 +181,7 @@ run "$SANDBOX_BIN" update "$PRIMARY"
 run lxc exec "$PRIMARY" -- bash -lc \
   'systemctl is-enabled --quiet sandbox-novnc.service; systemctl is-active --quiet sandbox-novnc.service; test -x /usr/local/bin/deskbot'
 assert_ssh "$PRIMARY"
+assert_desktop_session "$PRIMARY"
 
 log "testing stop, public copy, and external binds"
 run "$SANDBOX_BIN" stop "$PRIMARY"

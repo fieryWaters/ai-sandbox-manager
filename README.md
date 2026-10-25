@@ -55,7 +55,6 @@ generated from heredocs:
 ```text
 sandbox                  Host CLI (the only entry point on Spark)
 install.sh               In-box installer: packages + copies vm/ into place
-uninstall-managed.sh     Removes managed tooling; preserves user state
 vm/bin/                  deskbot, chromium launcher, service start scripts
 vm/systemd/              sandbox-vnc / sandbox-novnc / sandbox-cua-server units
 vm/doctor/               Pixel and agent-trace validation run by doctor
@@ -264,6 +263,10 @@ one-shot prompt), the deskbot command surface, direct deskbot screenshot
 pixels, a Codex-mediated deskbot browser smoke (trace must show deskbot and
 no forbidden paths), and a Claude-mediated deskbot browser smoke. The pixel
 checks validate a magenta test page actually rendered on the shared desktop.
+Only the LXD instance checks are critical, because every other check runs
+through the instance; the rest warn, so one run reports every problem. The
+Codex, Claude, and GitHub checks are skipped when the box has no credentials
+for them.
 
 ## Testing Strategy
 
@@ -281,7 +284,7 @@ copy, export/import, public exposure, GitHub grant/revoke, and destruction:
 
 ```bash
 cd ~
-/mnt/external_ssd/git-repos/ai-sandbox-manager/tests/acceptance.sh
+~/git-repos/ai-sandbox-manager/tests/acceptance.sh
 ```
 
 To test the apt lock retry deterministically, hold the real apt lists lock in
