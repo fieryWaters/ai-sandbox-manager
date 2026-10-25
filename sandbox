@@ -121,8 +121,8 @@ write_ssh_config() {
   touch "$SSH_KNOWN_HOSTS"; chmod 600 "$SSH_KNOWN_HOSTS"
   remove_managed_ssh_block "$name"
   ssh_host_exists_unmanaged "$name" && die "~/.ssh/config has unmanaged Host ${name}; refusing to edit"
+  # The block is everything between its markers, so removing it leaves nothing behind
   cat >>"$SSH_MANAGED_CONFIG" <<EOF
-
 # >>> ai-sandbox ${name}
 Host ${name}
   HostName 127.0.0.1
@@ -530,7 +530,7 @@ sync_profiles() {
   # OpenCode API key — {env:NEURALWATT_API_KEY} must resolve in the box
   if [ -n "${NEURALWATT_API_KEY:-}" ]; then
     local rc_tmp; rc_tmp="$(mktemp)"
-    printf '\n# >>> ai-sandbox opencode env\nexport NEURALWATT_API_KEY=%q\n# <<< ai-sandbox opencode env\n' "$NEURALWATT_API_KEY" >"$rc_tmp"
+    printf '# >>> ai-sandbox opencode env\nexport NEURALWATT_API_KEY=%q\n# <<< ai-sandbox opencode env\n' "$NEURALWATT_API_KEY" >"$rc_tmp"
     for rc_file in .bashrc .profile; do
       vm_exec "$name" "sed -i '/^# >>> ai-sandbox opencode env\$/,/^# <<< ai-sandbox opencode env\$/d' /home/$user/$rc_file 2>/dev/null || true"
       lxc file push -p "$rc_tmp" "$name/home/$user/${rc_file}.ai-sandbox-opencode-env"
